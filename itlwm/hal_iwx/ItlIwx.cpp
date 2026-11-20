@@ -1260,6 +1260,7 @@ iwx_ctxt_info_gen3_init(struct iwx_softc *sc, const struct iwx_fw_sects *fws)
     prph_sc_ctrl->version.mac_id =
         htole16((uint16_t)IWX_READ(sc, IWX_CSR_HW_REV));
     prph_sc_ctrl->version.size = htole16(sizeof(*prph_scratch) / 4);
+    sc->sc_diag_prph_scratch_size = sizeof(*prph_scratch) / 4;
     
     control_flags = IWX_PRPH_SCRATCH_RB_SIZE_4K;
     control_flags |= IWX_PRPH_SCRATCH_MTR_MODE;
@@ -1724,8 +1725,16 @@ iwx_read_firmware(struct iwx_softc *sc)
                 api = (struct iwx_ucode_api *)tlv_data;
                 idx = le32toh(api->api_index);
                 if (idx >= howmany(IWX_NUM_UCODE_TLV_API, 32)) {
-                    err = EINVAL;
-                    goto parse_out;
+                    /*
+                     * Out-of-range bit set: skip it, do not abort the parse.
+                     * Linux iwl_set_ucode_api_flags() only warns and returns
+                     * (iwl-drv.c:552-557); aborting here throws away every TLV
+                     * after this one, which is where all SEC_RT sections are.
+                     */
+                    XYLog("%s: api flags index %d larger than supported by "
+                          "driver\n", DEVNAME(sc), idx);
+                    sc->sc_diag_api_dropped++;
+                    break;
                 }
                 for (i = 0; i < 32; i++) {
                     if ((le32toh(api->api_flags) & (1 << i)) == 0)
@@ -1745,7 +1754,24 @@ iwx_read_firmware(struct iwx_softc *sc)
                 capa = (struct iwx_ucode_capa *)tlv_data;
                 idx = le32toh(capa->api_index);
                 if (idx >= howmany(IWX_NUM_UCODE_TLV_CAPA, 32)) {
-                    goto parse_out;
+                    /*
+                     * Sc-a0 ships an ENABLED_CAPABILITIES TLV with
+                     * api_index == 4 (bits 128..159) as its 9th TLV, before
+                     * the first SEC_RT. ItlIwx only keeps
+                     * howmany(IWX_NUM_UCODE_TLV_CAPA, 32) == 4 sets, so the
+                     * old "goto parse_out" left err == 0 but ended the loop:
+                     * 0 of 70 SEC_RT sections were stored and fw_status was
+                     * set to DONE. iwx_ctxt_info_gen3_init() then fed an empty
+                     * fws to iwx_init_fw_sec(), nothing was copied to DRAM,
+                     * ROM_START had no image to run and ALIVE never arrived.
+                     *
+                     * Linux treats this as a warn-and-continue
+                     * (iwl_set_ucode_capabilities(), iwl-drv.c:573-578).
+                     */
+                    XYLog("%s: capa flags index %d larger than supported by "
+                          "driver\n", DEVNAME(sc), idx);
+                    sc->sc_diag_capa_dropped++;
+                    break;
                 }
                 for (i = 0; i < 32; i++) {
                     if ((le32toh(capa->api_capa) & (1 << i)) == 0)
@@ -1983,6 +2009,8 @@ iwx_read_firmware(struct iwx_softc *sc)
      */
     sc->sc_diag_sect_count = fw->fw_sects[IWX_UCODE_TYPE_REGULAR].fw_count;
     sc->sc_diag_sect_max = IWX_UCODE_SECT_MAX;
+    sc->sc_diag_sect_len_total =
+        (uint32_t)fw->fw_sects[IWX_UCODE_TYPE_REGULAR].fw_totlen;
     iwx_publish_diag(sc);
     
 parse_out:
@@ -5270,6 +5298,30 @@ iwx_load_firmware(struct iwx_softc *sc)
     }
     
     err = iwx_wait_notification(sc, &sc->sc_uc.uc_intr, 1, 1000);
+    /*
+     * Snapshot the registers that decide "did the firmware actually start"
+     * before anything below can change them. Read unconditionally: on the
+     * failure path these values are the only evidence we can get, because an
+     * OpenCore-injected kext cannot reach logd from the installer.
+     *
+     *   CSR_FUNC_SCRATCH     must have been written with 0x01010101 by the
+     *                        host right before ROM_START; if it still reads
+     *                        that value the kick was issued.
+     *   CSR_GP_CNTRL         ROM_START (bit 7) is self-clearing once the ROM
+     *                        consumed the image; MAC_STATUS (bit 20) shows the
+     *                        MAC is out of reset.
+     *   CSR_INT              ALIVE is bit 0; a set bit here with uc_intr == 0
+     *                        would mean the notification arrived but the
+     *                        handler never ran.
+     *   CSR_CTXT_INFO_BOOT_CTRL  AUTO_FUNC_BOOT_ENA (bit 1) must be set.
+     */
+    sc->sc_diag_func_scratch = IWX_READ(sc, IWX_CSR_FUNC_SCRATCH);
+    sc->sc_diag_gp_cntrl     = IWX_READ(sc, IWX_CSR_GP_CNTRL);
+    sc->sc_diag_int_status   = IWX_READ(sc, IWX_CSR_INT);
+    sc->sc_diag_ctxt_boot_ctrl = IWX_READ(sc, IWX_CSR_CTXT_INFO_BOOT_CTRL);
+    sc->sc_diag_alive_wait_loops = err;   /* 0 = ALIVE, EWOULDBLOCK = timeout */
+    iwx_publish_diag(sc);
+
     if (err == ENXIO)
         return err;
     if (!err && !sc->sc_uc.uc_ok)
@@ -20260,6 +20312,15 @@ iwx_init_diag(struct iwx_softc *sc)
     sc->sc_diag_fw_ver[0] = '\0';
     sc->sc_diag_sect_max = IWX_UCODE_SECT_MAX;
     sc->sc_diag_sect_count = -1;
+    sc->sc_diag_api_dropped = 0;
+    sc->sc_diag_capa_dropped = 0;
+    sc->sc_diag_func_scratch = 0;
+    sc->sc_diag_gp_cntrl = 0;
+    sc->sc_diag_int_status = 0;
+    sc->sc_diag_ctxt_boot_ctrl = 0;
+    sc->sc_diag_prph_scratch_size = 0;
+    sc->sc_diag_sect_len_total = 0;
+    sc->sc_diag_alive_wait_loops = -1;
     sc->sc_diag_pnvm = "not-reached";
     sc->sc_diag_alive = -1;
     sc->sc_diag_init = "not-reached";
@@ -20307,6 +20368,15 @@ iwx_publish_diag(struct iwx_softc *sc)
     iwx_set_diag_string(device, "xe3-iwx-fwver", sc->sc_diag_fw_ver);
     device->setProperty("xe3-iwx-sectmax", sc->sc_diag_sect_max, 32);
     device->setProperty("xe3-iwx-sectcount", sc->sc_diag_sect_count, 32);
+    device->setProperty("xe3-iwx-sectlen", sc->sc_diag_sect_len_total, 32);
+    device->setProperty("xe3-iwx-capa-dropped", sc->sc_diag_capa_dropped, 32);
+    device->setProperty("xe3-iwx-api-dropped", sc->sc_diag_api_dropped, 32);
+    device->setProperty("xe3-iwx-func-scratch", sc->sc_diag_func_scratch, 32);
+    device->setProperty("xe3-iwx-gp-cntrl", sc->sc_diag_gp_cntrl, 32);
+    device->setProperty("xe3-iwx-int-status", sc->sc_diag_int_status, 32);
+    device->setProperty("xe3-iwx-ctxt-boot-ctrl", sc->sc_diag_ctxt_boot_ctrl, 32);
+    device->setProperty("xe3-iwx-prph-scratch-size", sc->sc_diag_prph_scratch_size, 32);
+    device->setProperty("xe3-iwx-alive-loops", sc->sc_diag_alive_wait_loops, 32);
     iwx_set_diag_string(device, "xe3-iwx-pnvm", sc->sc_diag_pnvm);
     device->setProperty("xe3-iwx-alive", sc->sc_diag_alive, 32);
     iwx_set_diag_string(device, "xe3-iwx-init", sc->sc_diag_init);

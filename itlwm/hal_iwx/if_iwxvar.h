@@ -692,6 +692,19 @@ struct iwx_softc {
 	char sc_diag_fw_ver[16];
 	int sc_diag_sect_max;
 	int sc_diag_sect_count;
+	/* TLV sets dropped because they pointed past the driver's bit arrays.
+	 * Non-zero on sc-a0 is expected and harmless: Linux warns and goes on. */
+	int sc_diag_api_dropped;
+	int sc_diag_capa_dropped;
+	/* Raw CSR snapshots taken when ALIVE fails, to tell "firmware never
+	 * started" from "firmware started but the notification never arrived". */
+	uint32_t sc_diag_func_scratch;
+	uint32_t sc_diag_gp_cntrl;
+	uint32_t sc_diag_int_status;
+	uint32_t sc_diag_ctxt_boot_ctrl;
+	uint32_t sc_diag_prph_scratch_size;
+	uint32_t sc_diag_sect_len_total;
+	int sc_diag_alive_wait_loops;
 	const char *sc_diag_pnvm;
 	int sc_diag_alive;
 	const char *sc_diag_init;
