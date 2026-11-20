@@ -69,10 +69,24 @@ probe(IOService *provider, SInt32 *score)
     IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
     if (!device)
         return NULL;
+    /*
+     * Publish the PCI identity first: everything below can reject the card, and
+     * the installer's logd is unreachable, so a wrapper that leaves no node
+     * would otherwise give no clue which device or which rejected check it was.
+     */
+    if (device) {
+        device->setProperty("xe3-wrapper-device",
+                            device->configRead16(kIOPCIConfigDeviceID), 32);
+        device->setProperty("xe3-wrapper-subsystem",
+                            device->configRead16(kIOPCIConfigSubSystemID), 32);
+    }
     const int kind = ItlIwx::iwx_match(device) ? 1 : ItlIwm::iwm_match(device) ? 2 :
         ItlIwn::iwn_match(device) ? 3 : 0;
-    if (!kind)
+    if (!kind) {
+        if (device)
+            device->setProperty("xe3-wrapper-probe", "no-hal-for-device");
         return NULL;
+    }
     XYLog("%s Found\n", __FUNCTION__);
     if (!claimedCard) {
         if (!OSCompareAndSwap(0, 1, &gCardClaimed)) {
@@ -96,6 +110,8 @@ probe(IOService *provider, SInt32 *score)
         msiCap = 0;
     if (!fHalService || (!msiCap && !msixCap)) {
         XYLog("%s %s\n", __FUNCTION__, fHalService ? "No MSI cap" : "no memory");
+        device->setProperty("xe3-wrapper-probe",
+                            fHalService ? "no-msi-capability" : "hal-alloc-failed");
         OSSafeReleaseNULL(fHalService);
         claimedCard = false;
         OSCompareAndSwap(1, 0, &gCardClaimed);
@@ -106,6 +122,7 @@ probe(IOService *provider, SInt32 *score)
     if (msiCap)
         pciMsiSetEnable(device, msiCap, 1);
     this->pciNub = device;
+    device->setProperty("xe3-wrapper-probe", "claimed");
     return this;
 }
 

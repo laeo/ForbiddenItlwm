@@ -532,6 +532,15 @@ public:
     int    iwx_preinit(struct iwx_softc *);
     void    iwx_attach_hook(struct device *);
     bool    iwx_attach(struct iwx_softc *, struct pci_attach_args *);
+    /*
+     * Records one step of the bring-up on the IOPCIDevice as xe3-iwx-*.
+     * Safe to call from any of the iwx_ functions: the softc is the target and
+     * the PCI tag is valid for as long as the card is attached.
+     */
+    static void    iwx_diag_stage(struct iwx_softc *, const char *);
+    static void    iwx_diag_fail(struct iwx_softc *, const char *, const char *);
+    static void    iwx_publish_diag(struct iwx_softc *);
+    static void    iwx_init_diag(struct iwx_softc *);
     static void    iwx_init_task(void *);
     int    iwx_activate(struct iwx_softc *, int);
     int    iwx_resume(struct iwx_softc *);

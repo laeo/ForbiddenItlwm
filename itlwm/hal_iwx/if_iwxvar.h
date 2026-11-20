@@ -125,6 +125,8 @@
 #define IWL_CFG_MAC_TYPE_SOF        0x43
 #define IWL_CFG_MAC_TYPE_MA        0x44
 #define IWL_CFG_MAC_TYPE_BZ        0x46
+/* Scarborough (Wi-Fi 7 BE2xx on Panther Lake and later). Linux: IWL_CFG_MAC_TYPE_SC. */
+#define IWL_CFG_MAC_TYPE_SC        0x48
 
 #define IWL_CFG_RF_TYPE_TH        0x105
 #define IWL_CFG_RF_TYPE_TH1        0x108
@@ -225,7 +227,13 @@ struct iwx_tx_radiotap_header {
 	 (1 << IEEE80211_RADIOTAP_RATE) |				\
 	 (1 << IEEE80211_RADIOTAP_CHANNEL))
 
-#define IWX_UCODE_SECT_MAX 60
+/*
+ * Scarborough (sc-a0) firmware carries 70 SEC_RT sections, more than the 60 the
+ * Qu/So/Ma parts use. Linux keeps a 96 entry table (IWL_UCODE_SECTION_MAX is sized
+ * from the biggest firmware, not from the oldest). With 60 the parse stops at
+ * section 61 with EINVAL and the driver reports "firmware parse error 22".
+ */
+#define IWX_UCODE_SECT_MAX 96
 
 /*
  * fw_status is used to determine if we've already parsed the firmware file
@@ -652,6 +660,43 @@ struct iwx_softc {
 	int sc_device_family;
 #define IWX_DEVICE_FAMILY_22000	1
 #define IWX_DEVICE_FAMILY_AX210	2
+/*
+ * Placed after AX210 on purpose: every ">= IWX_DEVICE_FAMILY_AX210" test in this
+ * file is a gen3/v2 context-info or AX210-and-later register test, which SC
+ * (gen2=true, integrated=true, umac_prph_offset=0x300000 in Linux iwl_sc_mac_cfg)
+ * also needs. The comparisons that must not include SC are the ones against
+ * IWX_DEVICE_FAMILY_22000, and those stay false either way.
+ */
+#define IWX_DEVICE_FAMILY_SC	3
+
+	/*
+	 * Diagnostics for a card that never reaches the network stack. The
+	 * installer's logd is unreachable and IOLog from an OpenCore-injected
+	 * kext does not reach the unified log, so the only channel left is the
+	 * I/O Registry: every step below records itself here, and
+	 * iwx_publish_diag() copies it onto the IOPCIDevice as xe3-iwx-*
+	 * properties. Without this, "AirportItlwm did not appear" is the whole
+	 * symptom and every failure between cfg selection and INIT_COMPLETE
+	 * looks identical.
+	 */
+	const char *sc_diag_stage;
+	const char *sc_diag_error;
+	int sc_diag_attach_ok;
+	uint16_t sc_diag_device;
+	uint16_t sc_diag_subdevice;
+	uint16_t sc_diag_mac_type;
+	uint16_t sc_diag_rf_type;
+	int sc_diag_cfg_found;
+	const char *sc_diag_cfg_name;
+	const char *sc_diag_fw_name;
+	char sc_diag_fw_ver[16];
+	int sc_diag_sect_max;
+	int sc_diag_sect_count;
+	const char *sc_diag_pnvm;
+	int sc_diag_alive;
+	const char *sc_diag_init;
+	int sc_diag_hw_rev;
+	int sc_diag_rf_id;
 
 	struct iwx_dma_info ctxt_info_dma;
 	struct iwx_self_init_dram init_dram;

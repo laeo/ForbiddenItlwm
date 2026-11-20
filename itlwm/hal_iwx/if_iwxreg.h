@@ -583,6 +583,14 @@ enum iwx_fw_ini_allocation_id {
 #define IWX_CSR_GPIO_IN             (0x018) /* read external chip pins */
 #define IWX_CSR_RESET               (0x020) /* busmaster enable, NMI, etc*/
 #define IWX_CSR_GP_CNTRL            (0x024)
+/*
+ * FUNC_SCRATCH is the Bz/SC (and later) replacement for UREG_CPU_INIT_RUN as the
+ * "let the firmware out of reset" handshake. Linux writes FUNC_SCRATCH_1 before
+ * GP_CNTRL.ROM_START and polls it in iwl_pcie_prepare_card_hw (pcie/trans.c);
+ * the older parts never had this register.
+ */
+#define IWX_CSR_FUNC_SCRATCH        (0x02c)
+#define IWX_CSR_FUNC_SCRATCH_INIT_VALUE (0x01010101)
 
 /* 2nd byte of IWX_CSR_INT_COALESCING, not accessible via iwl_write32()! */
 #define IWX_CSR_INT_PERIODIC_REG    (0x005)
@@ -763,6 +771,29 @@ enum iwx_fw_ini_allocation_id {
 #define IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE              (0x00000004)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ         (0x00000008)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP         (0x00000010)
+/*
+ * Bz/SC moved the "MAC finished powering up" and "host may own the MAC" ack bits
+ * out of the low nibble, and moved the bus-master stop and the software reset
+ * from CSR_RESET (0x020) into CSR_GP_CNTRL (0x024). Linux iwl-csr.h:
+ *
+ *   MAC_INIT                  BIT(6)   0x00000040  (was INIT_DONE 0x04)
+ *   ROM_START                 BIT(7)   0x00000080
+ *   MAC_STATUS                BIT(20)  0x00100000  (was MAC_CLOCK_READY 0x01)
+ *   BZ_MAC_ACCESS_REQ         BIT(21)  0x00200000  (was MAC_ACCESS_REQ 0x08)
+ *   BUS_MASTER_DISABLE_STATUS BIT(28)  0x10000000  (replaces RESET.STOP_MASTER)
+ *   BUS_MASTER_DISABLE_REQ    BIT(29)  0x20000000
+ *   SW_RESET                  BIT(31)  0x80000000  (replaces RESET.SW_RESET)
+ *
+ * Reusing the pre-Bz bits on SC makes every "wait for the MAC" poll spin until
+ * its timeout (25 s in apm_init, 150 s in nic_lock) and then fail.
+ */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT               (0x00000040)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START              (0x00000080)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS             (0x00100000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ      (0x00200000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS (0x10000000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ    (0x20000000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_SW_RESET               (0x80000000)
 
 #define IWX_CSR_GP_CNTRL_REG_VAL_MAC_ACCESS_EN           (0x00000001)
 

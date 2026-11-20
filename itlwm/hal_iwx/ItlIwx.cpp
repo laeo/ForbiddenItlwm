@@ -1333,10 +1333,29 @@ iwx_ctxt_info_gen3_init(struct iwx_softc *sc, const struct iwx_fw_sects *fws)
     
     iwx_set_ltr(sc);
     
-    if (!iwx_nic_lock(sc))
-        return EBUSY;
-    iwx_write_umac_prph(sc, IWX_UREG_CPU_INIT_RUN, 1);
-    iwx_nic_unlock(sc);
+    /*
+     * "Kick the firmware" differs by family (Linux
+     * iwl_trans_pcie_gen2_start_fw(), pcie/trans-gen2.c):
+     *
+     *   >= BZ/SC : write CSR_FUNC_SCRATCH = 0x01010101, then set
+     *              CSR_GP_CNTRL.ROM_START. UREG_CPU_INIT_RUN does not exist
+     *              for these parts.
+     *   >= AX210 : iwl_trans_write_umac_prph(UREG_CPU_INIT_RUN, 1)
+     *   older    : iwl_trans_write_prph(UREG_CPU_INIT_RUN, 1)
+     *
+     * Keeping the umac-prph kick on SC leaves ROM_START unset and the firmware
+     * never starts, so the ALIVE notification is never sent.
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        IWX_WRITE(sc, IWX_CSR_FUNC_SCRATCH, IWX_CSR_FUNC_SCRATCH_INIT_VALUE);
+        IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+                    IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START);
+    } else {
+        if (!iwx_nic_lock(sc))
+            return EBUSY;
+        iwx_write_umac_prph(sc, IWX_UREG_CPU_INIT_RUN, 1);
+        iwx_nic_unlock(sc);
+    }
     
     return 0;
     
@@ -1539,10 +1558,16 @@ iwx_read_firmware(struct iwx_softc *sc)
 //    fw->fw_rawdata = malloc(context.resource->getLength(), 1, 1);
 //    memcpy(fw->fw_rawdata, context.resource->getBytesNoCopy(), context.resource->getLength());
 //    fw->fw_rawsize = context.resource->getLength();
+    sc->sc_diag_fw_name = sc->sc_fwname;
+    iwx_publish_diag(sc);
+    iwx_diag_stage(sc, "fw-read");
     fwData = getFWDescByName(sc->sc_fwname);
     if (fwData == NULL) {
         err = EINVAL;
         XYLog("%s resource load fail.\n", sc->sc_fwname);
+        /* The name is built from iwl_cfg.fwname; a mismatch here means the
+         * string and itlwm/firmware/ do not agree byte for byte. */
+        iwx_diag_fail(sc, "fw-read", "firmware-not-in-kext");
         goto out;
     }
     fw->fw_rawsize = fwData->getLength() * 4;
@@ -1571,6 +1596,9 @@ iwx_read_firmware(struct iwx_softc *sc)
              IWX_UCODE_MAJOR(le32toh(uhdr->ver)),
              IWX_UCODE_MINOR(le32toh(uhdr->ver)),
              IWX_UCODE_API(le32toh(uhdr->ver)));
+    strlcpy(sc->sc_diag_fw_ver, sc->sc_fwver, sizeof(sc->sc_diag_fw_ver));
+    iwx_publish_diag(sc);
+    iwx_diag_stage(sc, "fw-parse");
     data = uhdr->data;
     len = fw->fw_rawsize - sizeof(*uhdr);
     
@@ -1948,11 +1976,21 @@ iwx_read_firmware(struct iwx_softc *sc)
     KASSERT(err == 0, "err == 0");
     
     XYLog("firmware parse done\n");
+    /*
+     * How many SEC_RT sections the firmware actually carried, against the
+     * IWX_UCODE_SECT_MAX the table allows. Sc-a0 needs 70 and the original 60
+     * made the parse stop with EINVAL ("firmware parse error 22") before ALIVE.
+     */
+    sc->sc_diag_sect_count = fw->fw_sects[IWX_UCODE_TYPE_REGULAR].fw_count;
+    sc->sc_diag_sect_max = IWX_UCODE_SECT_MAX;
+    iwx_publish_diag(sc);
     
 parse_out:
     if (err) {
         XYLog("%s: firmware parse error %d, "
               "section type %d\n", DEVNAME(sc), err, tlv_type);
+        sc->sc_diag_error = "firmware-parse-error";
+        iwx_publish_diag(sc);
     }
     
 out:
@@ -2150,13 +2188,23 @@ iwx_read_pnvm(struct iwx_softc *sc)
      * The prefix unfortunately includes a hyphen at the end, so
      * don't add the dot here...
      */
+    /*
+     * "iwlwifi-so-a0-gf-a0-68.ucode" -> "iwlwifi-so-a0-gf-a0.pnvm": cut at the
+     * separator that starts the version segment, i.e. keep everything before the
+     * last dash. The old code cut at (find - name - 1), one byte too early, so it
+     * asked for "iwlwifi-so-a0-gf-a.pnvm" -- a name that exists in no firmware
+     * set. That made every PNVM load fail, which is why the "no PNVM is not
+     * fatal" change below is required too, not optional.
+     */
+    if (sc->sc_fwname == NULL || sizeof(fwname_copy) < strlen(sc->sc_fwname) + 1)
+        goto out;
     memcpy(fwname_copy, sc->sc_fwname, sizeof(fwname_copy));
     find = strrchr(sc->sc_fwname, '-');
     if (!find)
         goto out;
-    if (find - sc->sc_fwname - 1 <= 0)
+    if (find - sc->sc_fwname <= 0)
         goto out;
-    fwname_copy[find - sc->sc_fwname - 1] = '\0';
+    fwname_copy[find - sc->sc_fwname] = '\0';
     
     snprintf(pnvm_name, sizeof(pnvm_name), "%s.pnvm",
          fwname_copy);
@@ -2164,7 +2212,7 @@ iwx_read_pnvm(struct iwx_softc *sc)
     fwData = getFWDescByName(pnvm_name);
 
     if (fwData == NULL) {
-        err = EINVAL;
+        err = ENOENT;
         XYLog("%s resource load fail.\n", pnvm_name);
         goto out;
     }
@@ -2239,12 +2287,33 @@ iwx_load_pnvm(struct iwx_softc *sc)
     int err;
     
     /* if the SKU_ID is empty, there's nothing to do */
-    if (!sc->sku_id[0] && !sc->sku_id[1] && !sc->sku_id[2])
+    if (!sc->sku_id[0] && !sc->sku_id[1] && !sc->sku_id[2]) {
+        sc->sc_diag_pnvm = "absent-no-sku";
+        iwx_publish_diag(sc);
         return 0;
+    }
     
-    if (!iwx_read_pnvm(sc)) {
-        goto out;
-    };
+    /*
+     * A PNVM image is optional for the driver's own bring-up: Linux
+     * iwl_pnvm_load_pnvm_to_trans() logs "PNVM is not available" and returns 0
+     * when the file is missing, and this card has no sc-a0 PNVM anywhere in
+     * linux-firmware. Treating a missing image as fatal instead produced a
+     * 2 s IWX_PNVM_COMPLETE timeout (ETIMEDOUT) that aborted the whole
+     * INIT image load. Skipping the notification is only safe because no PNVM
+     * was sent, so the firmware has nothing to acknowledge.
+     */
+    err = iwx_read_pnvm(sc);
+    if (err) {
+        XYLog("%s: no PNVM image (%d), continuing without it\n",
+              DEVNAME(sc), err);
+        sc->sc_diag_pnvm = "absent-skipped";
+        iwx_publish_diag(sc);
+        sc->sc_init_complete &= ~IWX_PNVM_COMPLETE;
+        iwx_pnvm_free(&sc->sc_fw);
+        return 0;
+    }
+    sc->sc_diag_pnvm = "found";
+    iwx_publish_diag(sc);
     
 out:
     sc->sc_init_complete &= ~IWX_PNVM_COMPLETE;
@@ -2399,6 +2468,32 @@ iwx_poll_bit(struct iwx_softc *sc, int reg, uint32_t bits, uint32_t mask,
     }
 }
 
+/*
+ * Bz/SC moved MAC_ACCESS_REQ to bit 21 and made the ack MAC_STATUS (bit 20)
+ * instead of MAC_CLOCK_READY. See iwx_init_done_bit() for the table.
+ */
+static inline uint32_t iwx_mac_access_req_bit(struct iwx_softc *sc)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        return IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ;
+    return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ;
+}
+
+static inline uint32_t iwx_mac_access_ack_val(struct iwx_softc *sc)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS;
+    return IWX_CSR_GP_CNTRL_REG_VAL_MAC_ACCESS_EN;
+}
+
+static inline uint32_t iwx_mac_access_ack_mask(struct iwx_softc *sc)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS;
+    return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY
+         | IWX_CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP;
+}
+
 int ItlIwx::
 iwx_nic_lock(struct iwx_softc *sc)
 {
@@ -2408,20 +2503,20 @@ iwx_nic_lock(struct iwx_softc *sc)
         return 1; /* already locked */
     }
     
-    IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
-                IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+    IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, iwx_mac_access_req_bit(sc));
     
     DELAY(2);
     
     if (iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
-                     IWX_CSR_GP_CNTRL_REG_VAL_MAC_ACCESS_EN,
-                     IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY
-                     | IWX_CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP, 150000)) {
+                     iwx_mac_access_ack_val(sc),
+                     iwx_mac_access_ack_mask(sc), 150000)) {
         sc->sc_nic_locks++;
         return 1;
     }
     
     XYLog("%s: acquiring device failed\n", DEVNAME(sc));
+    sc->sc_diag_error = "nic-lock-failed";
+    iwx_publish_diag(sc);
     return 0;
 }
 
@@ -2437,8 +2532,7 @@ iwx_nic_unlock(struct iwx_softc *sc)
 {
     if (sc->sc_nic_locks > 0) {
         if (--sc->sc_nic_locks == 0)
-            IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
-                        IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+            IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL, iwx_mac_access_req_bit(sc));
     } else
         XYLog("%s: NIC already unlocked\n", DEVNAME(sc));
 }
@@ -3141,6 +3235,47 @@ iwx_apm_config(struct iwx_softc *sc)
  * e.g. after platform boot or shutdown.
  * NOTE:  This does not load uCode nor start the embedded processor
  */
+/*
+ * Register-bit selection for Bz/SC, whose GP_CNTRL layout differs from the
+ * Qu/So/Ma parts (Linux iwl-csr.h):
+ *
+ *   pre-Bz: INIT_DONE 0x04, MAC_CLOCK_READY 0x01, MAC_ACCESS_REQ 0x08, ack 0x01
+ *   Bz/SC : MAC_INIT  0x40, MAC_STATUS      0x00100000, BZ_MAC_ACCESS_REQ
+ *           0x00200000, ack MAC_STATUS 0x00100000
+ *
+ * Using the pre-Bz bits on SC means every "wait for the MAC" poll waits out its
+ * full timeout (25 s for apm_init, 150 s for nic_lock) and fails.
+ */
+static inline uint32_t iwx_init_done_bit(struct iwx_softc *sc)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT;
+    return IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE;
+}
+
+static inline uint32_t iwx_mac_status_bit(struct iwx_softc *sc)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS;
+    return IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY;
+}
+
+/*
+ * "Reset entire device" moved from CSR_RESET.SW_RESET to CSR_GP_CNTRL.SW_RESET
+ * for Bz/SC (Linux iwl_trans_pcie_sw_reset(), pcie/trans.c:81-89, which uses a
+ * longer settle time there as well: 10-20 ms instead of 5-6 ms).
+ */
+static inline void iwx_device_sw_reset(struct iwx_softc *sc)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, IWX_CSR_GP_CNTRL_REG_FLAG_SW_RESET);
+        DELAY(10000);
+    } else {
+        IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
+        DELAY(5000);
+    }
+}
+
 int ItlIwx::
 iwx_apm_init(struct iwx_softc *sc)
 {
@@ -3169,7 +3304,7 @@ iwx_apm_init(struct iwx_softc *sc)
      * Set "initialization complete" bit to move adapter from
      * D0U* --> D0A* (powered-up active) state.
      */
-    IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
+    IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, iwx_init_done_bit(sc));
     
     /*
      * Wait for clock stabilization; once stabilized, access to
@@ -3177,16 +3312,19 @@ iwx_apm_init(struct iwx_softc *sc)
      * and accesses to uCode SRAM.
      */
     if (!iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
-                      IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY,
-                      IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY, 25000)) {
+                      iwx_mac_status_bit(sc),
+                      iwx_mac_status_bit(sc), 25000)) {
         XYLog("%s: timeout waiting for clock stabilization\n",
               DEVNAME(sc));
         err = ETIMEDOUT;
         goto out;
     }
 out:
-    if (err)
+    if (err) {
         XYLog("%s: apm init error %d\n", DEVNAME(sc), err);
+        sc->sc_diag_error = "apm-init-timeout";
+        iwx_publish_diag(sc);
+    }
     return err;
 }
 
@@ -3203,20 +3341,34 @@ iwx_apm_stop(struct iwx_softc *sc)
                 IWX_CSR_RESET_LINK_PWR_MGMT_DISABLED);
     DELAY(5000);
     
-    /* stop device's busmaster DMA activity */
-    IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_STOP_MASTER);
-    
-    if (!iwx_poll_bit(sc, IWX_CSR_RESET,
-                      IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED,
-                      IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED, 100))
-        XYLog("%s: timeout waiting for master\n", DEVNAME(sc));
+    /*
+     * Stop the device's busmaster DMA activity. Bz/SC dropped STOP_MASTER and
+     * MASTER_DISABLED from CSR_RESET; the handshake moved into CSR_GP_CNTRL as
+     * BUS_MASTER_DISABLE_REQ -> BUS_MASTER_DISABLE_STATUS (Linux
+     * iwl_pcie_apm_stop_master(), pcie/trans.c, ">= IWL_DEVICE_FAMILY_BZ").
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+                    IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ);
+        if (!iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
+                          IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS,
+                          IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS,
+                          100))
+            XYLog("%s: timeout waiting for bus master disable\n", DEVNAME(sc));
+        DELAY(10000);
+    } else {
+        IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_STOP_MASTER);
+        if (!iwx_poll_bit(sc, IWX_CSR_RESET,
+                          IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED,
+                          IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED, 100))
+            XYLog("%s: timeout waiting for master\n", DEVNAME(sc));
+    }
     
     /*
      * Clear "initialization complete" bit to move adapter from
      * D0A* (powered-up Active) --> D0U* (Uninitialized) state.
      */
-    IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
-                IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
+    IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL, iwx_init_done_bit(sc));
 }
 
 void ItlIwx::
@@ -3338,8 +3490,7 @@ iwx_start_hw(struct iwx_softc *sc)
     iwx_clear_persistence_bit(sc);
     
     /* Reset the entire device */
-    IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
-    DELAY(5000);
+    iwx_device_sw_reset(sc);
     
     if (sc->sc_device_family == IWX_DEVICE_FAMILY_22000 && sc->sc_integrated) {
         IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
@@ -3356,8 +3507,7 @@ iwx_start_hw(struct iwx_softc *sc)
         iwx_force_power_gating(sc);
         
         /* Reset the entire device */
-        IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
-        DELAY(5000);
+        iwx_device_sw_reset(sc);
     }
     
     err = iwx_apm_init(sc);
@@ -3403,8 +3553,7 @@ iwx_stop_device(struct iwx_softc *sc)
 #endif
     
     /* Make sure (redundant) we've released our request to stay awake */
-    IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
-                IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+    IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL, iwx_mac_access_req_bit(sc));
     if (sc->sc_nic_locks > 0)
         XYLog("%s: %d active NIC locks forcefully cleared\n",
               DEVNAME(sc), sc->sc_nic_locks);
@@ -3414,8 +3563,7 @@ iwx_stop_device(struct iwx_softc *sc)
     iwx_apm_stop(sc);
     
     /* Reset the on-board processor. */
-    IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
-    DELAY(5000);
+    iwx_device_sw_reset(sc);
 #ifdef AIRPORT_VTD
     sc->sc_pcitag->setBusMasterEnable(false);
     iwx_reset_rx_ring(sc, &sc->rxq);
@@ -5246,18 +5394,30 @@ iwx_load_ucode_wait_alive(struct iwx_softc *sc)
     int err;
     
     err = iwx_read_firmware(sc);
-    if (err)
+    if (err) {
+        iwx_diag_fail(sc, "fw-read", "firmware-read-or-parse-failed");
         return err;
+    }
     
+    iwx_diag_stage(sc, "fw-start");
     err = iwx_start_fw(sc);
-    if (err)
+    if (err) {
+        iwx_diag_fail(sc, "fw-start", "start-fw-failed");
         return err;
+    }
     
+    iwx_diag_stage(sc, "alive-wait");
+    /* iwx_start_fw() returns before ALIVE; iwx_post_alive() waits for it. */
     err = iwx_load_pnvm(sc);
-    if (err)
+    if (err) {
+        iwx_diag_fail(sc, "pnvm", "pnvm-failed");
         return err;
+    }
     
     iwx_post_alive(sc);
+    sc->sc_diag_alive = 1;
+    iwx_publish_diag(sc);
+    iwx_diag_stage(sc, "alive-ok");
     
     return 0;
 }
@@ -5283,6 +5443,8 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
     err = iwx_load_ucode_wait_alive(sc);
     if (err) {
         XYLog("%s: failed to load init firmware\n", DEVNAME(sc));
+        sc->sc_diag_alive = 0;
+        iwx_diag_fail(sc, "load-init-fw", "load-ucode-wait-alive-failed");
         return err;
     }
     
@@ -5303,14 +5465,27 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
     if (err)
         return err;
 
-    /* INIT_COMPLETE can arrive before NVM_ACCESS_COMPLETE is acknowledged. */
+    /*
+     * INIT_COMPLETE can arrive before NVM_ACCESS_COMPLETE is acknowledged, and
+     * it has a 2 s budget. A timeout here with everything above at "ok" means
+     * the firmware started but never finished the INIT image.
+     */
+    sc->sc_diag_init = "waiting";
+    iwx_publish_diag(sc);
     err = iwx_wait_notification(sc, &sc->sc_init_complete, wait_flags, 2000);
-    if (err)
+    if (err) {
+        sc->sc_diag_init = "timeout";
+        iwx_diag_fail(sc, "init-complete", "init-complete-timeout");
         return err;
+    }
+    sc->sc_diag_init = "ok";
+    iwx_publish_diag(sc);
 
     if (readnvm) {
         err = iwx_nvm_get(sc);
         if (err) {
+            sc->sc_diag_init = "nvm-failed";
+            iwx_publish_diag(sc);
             XYLog("%s: failed to read nvm\n", DEVNAME(sc));
             return err;
         }
@@ -18782,6 +18957,24 @@ const struct iwl_cfg_trans_params iwl_ma_trans_cfg = {
     .integrated = 1,
 };
 
+/*
+ * Scarborough (Wi-Fi 7 on Panther Lake) transport parameters, copied from Linux
+ * cfg/sc.c iwl_sc_mac_cfg:
+ *   device_family = IWL_DEVICE_FAMILY_SC, integrated = true, gen2 = true,
+ *   umac_prph_offset = 0x300000, xtal_latency = 12000,
+ *   low_latency_xtal = true, ltr_delay = 2500us
+ * Reusing iwl_so_long_latency_trans_cfg would give the right xtal/ltr numbers but
+ * AX210 as the family, which would send apm_init/nic_lock back down the pre-Bz
+ * register path.
+ */
+const struct iwl_cfg_trans_params iwl_sc_trans_cfg = {
+    .device_family = IWX_DEVICE_FAMILY_SC,
+    .integrated = 1,
+    .xtal_latency = 12000,
+    .low_latency_xtal = 1,
+    .ltr_delay = IWX_SOC_FLAGS_LTR_APPLY_DELAY_2500,
+};
+
 const struct iwl_cfg_trans_params iwl_ax200_trans_cfg = {
     .device_family = IWX_DEVICE_FAMILY_22000,
     .bisr_workaround = 1,
@@ -18917,6 +19110,21 @@ const struct iwl_cfg iwl_cfg_snj_a0_mr_a0 = {
     .num_rbds = IWL_NUM_RBDS_AX210_HE,
 };
 
+/*
+ * Scarborough a0, GF (gf-a0) radio. This is the firmware the card actually asks
+ * for: `iwlwifi 0000:00:14.3: loaded firmware version 100.d6bb293f.0
+ * sc-a0-gf-a0-100.ucode op_mode iwlmvm` on Linux, and iwlwifi-sc-a0-gf-a0 is
+ * listed in cfg/rf-gf.c with API max 100. Linux sets tx_with_siso_diversity to 0
+ * here, so INIT_EXTENDED_CFG only carries IWX_INIT_NVM.
+ */
+const struct iwl_cfg iwl_cfg_sc_a0_gf_a0 = {
+    .name = "Intel(R) Wi-Fi 7 BE2xx (Sc)",
+    .fwname = "iwlwifi-sc-a0-gf-a0-100.ucode",
+    .uhb_supported = 1,
+    .device_family = IWX_DEVICE_FAMILY_SC,
+    .num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
 const struct iwl_cfg iwl_cfg_so_a0_hr_a0 = {
     .fwname = "iwlwifi-so-a0-hr-b0-68.ucode",
     .device_family = IWX_DEVICE_FAMILY_AX210,
@@ -18964,6 +19172,9 @@ static const struct pci_matchid iwx_devices[] = {
     /* Ma devices */
     {IWL_PCI_DEVICE(0x2729, PCI_ANY_ID, iwl_ma_trans_cfg)},
     {IWL_PCI_DEVICE(0x7E40, PCI_ANY_ID, iwl_ma_trans_cfg)},
+    
+    /* Sc devices (Panther Lake CNVi, Wi-Fi 7) */
+    {IWL_PCI_DEVICE(0xE440, PCI_ANY_ID, iwl_sc_trans_cfg)},
 };
 
 struct iwl_dev_info {
@@ -19895,7 +20106,17 @@ static const struct iwl_dev_info iwl_dev_info_table[] = {
                   IWL_CFG_MAC_TYPE_SO, IWL_CFG_ANY,
                   IWL_CFG_RF_TYPE_JF1, IWL_CFG_RF_ID_JF1_DIV,
                   IWL_CFG_NO_160, IWL_CFG_CORES_BT, IWL_CFG_NO_CDB,
-                  iwlax210_2ax_cfg_so_jf_b0, iwl9462_name)
+                  iwlax210_2ax_cfg_so_jf_b0, iwl9462_name),
+    
+    /* Sc (Panther Lake, Wi-Fi 7). The card reports CSR_HW_REV_TYPE 0x48 and
+     * CSR_HW_RFID_TYPE 0x10D, i.e. the same GF radio as AX211, so a single
+     * mac_type+rf_type row is enough: no subdevice, mac_step, rf_id, no_160
+     * or cores constraints, as Linux cfg/rf-gf.c does for SC. */
+    _IWL_DEV_INFO(IWL_CFG_ANY, IWL_CFG_ANY,
+                  IWL_CFG_MAC_TYPE_SC, IWL_CFG_ANY,
+                  IWL_CFG_RF_TYPE_GF, IWL_CFG_ANY,
+                  IWL_CFG_ANY, IWL_CFG_ANY, IWL_CFG_NO_CDB,
+                  iwl_cfg_sc_a0_gf_a0, iwl_ax211_name)
 };
 
 int ItlIwx::
@@ -19922,9 +20143,11 @@ iwx_preinit(struct iwx_softc *sc)
     int err, generation = sc->sc_generation;
     static int attached;
     
+    iwx_diag_stage(sc, "hw-prepare");
     err = iwx_prepare_card_hw(sc);
     if (err) {
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
+        iwx_diag_fail(sc, "hw-prepare", "prepare-card-hw-failed");
         return err;
     }
     
@@ -19953,6 +20176,10 @@ iwx_preinit(struct iwx_softc *sc)
     XYLog("%s: hw rev 0x%x, fw ver %s, address %s\n",
           DEVNAME(sc), sc->sc_hw_rev & IWX_CSR_HW_REV_TYPE_MSK,
           sc->sc_fwver, ether_sprintf(sc->sc_nvm.hw_addr));
+    sc->sc_diag_attach_ok = 1;
+    sc->sc_diag_error = "none";
+    iwx_diag_stage(sc, "ready");
+    iwx_publish_diag(sc);
     
     if (sc->sc_nvm.sku_cap_11n_enable)
         iwx_setup_ht_rates(sc);
@@ -19990,6 +20217,101 @@ iwx_attach_hook(struct device *self)
     iwx_preinit(sc);
 }
 
+/*
+ * Bring-up diagnostics, published on the IOPCIDevice.
+ *
+ * Why not XYLog: from an OpenCore-injected kext in the installer, dmesg is empty
+ * and `log show` cannot reach logd, so IOLog is a dead channel there. Properties
+ * survive because the IOPCIDevice outlives a failed AirportItlwm::start, and one
+ * `ioreg -r -c IOPCIDevice -l -w0 | grep xe3-iwx` then tells which step failed.
+ *
+ * These run on the attach path, which is the configuration thread: no locks are
+ * taken here and nothing blocks, so publishing cannot itself become the stall.
+ */
+/*
+ * setProperty() has no const char* overload: passing one converts to OSObject*
+ * at best and does not compile at worst. Build the OSString and release it, so a
+ * publish loop cannot leak one string per step.
+ */
+static void iwx_set_diag_string(IORegistryEntry *target, const char *key,
+                                const char *value)
+{
+    if (!target || !value)
+        return;
+    if (OSString *str = OSString::withCString(value)) {
+        target->setProperty(key, str);
+        str->release();
+    }
+}
+
+void ItlIwx::
+iwx_init_diag(struct iwx_softc *sc)
+{
+    sc->sc_diag_stage = "attach-start";
+    sc->sc_diag_error = "none";
+    sc->sc_diag_attach_ok = 0;
+    sc->sc_diag_device = 0;
+    sc->sc_diag_subdevice = 0;
+    sc->sc_diag_mac_type = 0;
+    sc->sc_diag_rf_type = 0;
+    sc->sc_diag_cfg_found = 0;
+    sc->sc_diag_cfg_name = "none";
+    sc->sc_diag_fw_name = "none";
+    sc->sc_diag_fw_ver[0] = '\0';
+    sc->sc_diag_sect_max = IWX_UCODE_SECT_MAX;
+    sc->sc_diag_sect_count = -1;
+    sc->sc_diag_pnvm = "not-reached";
+    sc->sc_diag_alive = -1;
+    sc->sc_diag_init = "not-reached";
+    sc->sc_diag_hw_rev = -1;
+    sc->sc_diag_rf_id = -1;
+}
+
+void ItlIwx::
+iwx_diag_stage(struct iwx_softc *sc, const char *stage)
+{
+    if (sc)
+        sc->sc_diag_stage = stage;
+}
+
+void ItlIwx::
+iwx_diag_fail(struct iwx_softc *sc, const char *stage, const char *error)
+{
+    if (!sc)
+        return;
+    sc->sc_diag_stage = stage;
+    sc->sc_diag_error = error;
+    iwx_publish_diag(sc);
+}
+
+void ItlIwx::
+iwx_publish_diag(struct iwx_softc *sc)
+{
+    if (!sc || !sc->sc_pcitag)
+        return;
+    IOPCIDevice *device = sc->sc_pcitag;
+    
+    iwx_set_diag_string(device, "xe3-iwx-stage", sc->sc_diag_stage);
+    iwx_set_diag_string(device, "xe3-iwx-error", sc->sc_diag_error);
+    device->setProperty("xe3-iwx-attach-ok", sc->sc_diag_attach_ok, 32);
+    device->setProperty("xe3-iwx-devid", sc->sc_diag_device, 32);
+    device->setProperty("xe3-iwx-subdevid", sc->sc_diag_subdevice, 32);
+    device->setProperty("xe3-iwx-mactype", sc->sc_diag_mac_type, 32);
+    device->setProperty("xe3-iwx-rftype", sc->sc_diag_rf_type, 32);
+    device->setProperty("xe3-iwx-hwrev-raw", sc->sc_diag_hw_rev, 32);
+    device->setProperty("xe3-iwx-rfid-raw", sc->sc_diag_rf_id, 32);
+    device->setProperty("xe3-iwx-cfg-found", sc->sc_diag_cfg_found, 32);
+    iwx_set_diag_string(device, "xe3-iwx-cfgname", sc->sc_diag_cfg_name);
+    device->setProperty("xe3-iwx-family", sc->sc_device_family, 32);
+    iwx_set_diag_string(device, "xe3-iwx-fwname", sc->sc_diag_fw_name);
+    iwx_set_diag_string(device, "xe3-iwx-fwver", sc->sc_diag_fw_ver);
+    device->setProperty("xe3-iwx-sectmax", sc->sc_diag_sect_max, 32);
+    device->setProperty("xe3-iwx-sectcount", sc->sc_diag_sect_count, 32);
+    iwx_set_diag_string(device, "xe3-iwx-pnvm", sc->sc_diag_pnvm);
+    device->setProperty("xe3-iwx-alive", sc->sc_diag_alive, 32);
+    iwx_set_diag_string(device, "xe3-iwx-init", sc->sc_diag_init);
+}
+
 bool ItlIwx::
 intrFilter(OSObject *object, IOFilterInterruptEventSource *src)
 {
@@ -20011,6 +20333,11 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     sc->sc_pcitag = pa->pa_tag;
     sc->sc_dmat = pa->pa_dmat;
     
+    /* Publish step by step, so a failed attach still says where it stopped. */
+    iwx_init_diag(sc);
+    iwx_publish_diag(sc);
+    iwx_diag_stage(sc, "pcie-cap");
+    
     //    rw_init(&sc->ioctl_rwl, "iwxioctl");
     
     err = pci_get_capability(sc->sc_pct, sc->sc_pcitag,
@@ -20018,8 +20345,10 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     if (err == 0) {
         XYLog("%s: PCIe capability structure not found!\n",
               DEVNAME(sc));
+        iwx_diag_fail(sc, "pcie-cap", "no-pcie-capability");
         return false;
     }
+    iwx_diag_stage(sc, "pci-setup");
     
     /* Clear device-specific "PCI retry timeout" register (41h). */
     reg = pci_conf_read(sc->sc_pct, sc->sc_pcitag, 0x40);
@@ -20039,6 +20368,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
                          &sc->sc_st, &sc->sc_sh, NULL, &sc->sc_sz, 0);
     if (err) {
         XYLog("%s: can't map mem space\n", DEVNAME(sc));
+        iwx_diag_fail(sc, "map-mem", "cannot-map-bar");
         return false;
     }
     if (0) {
@@ -20046,6 +20376,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         XYLog("msix intr mode\n");
     } else if (pci_intr_map_msi(pa, &sc->ih)) {
         XYLog("%s: can't map interrupt\n", DEVNAME(sc));
+        iwx_diag_fail(sc, "map-msi", "cannot-map-msi");
         return false;
     }
     
@@ -20074,6 +20405,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     }
     if (msiIntrIndex == -1) {
         XYLog("%s: can't find MSI interrupt controller\n", DEVNAME(sc));
+        iwx_diag_fail(sc, "find-msi", "no-msi-vector");
         return false;
     }
 
@@ -20089,6 +20421,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
                                                                              ,pa->pa_tag, msiIntrIndex);
     if (sc->sc_ih == NULL || pa->workloop->addEventSource(sc->sc_ih) != kIOReturnSuccess) {
         XYLog("%s: can't establish interrupt\n", DEVNAME(sc));
+        iwx_diag_fail(sc, "intr-establish", "cannot-establish-interrupt");
         return false;
     }
     sc->sc_ih->enable();
@@ -20112,10 +20445,25 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     uint16_t subsystem_device = sc->sc_pcitag->configRead16(kIOPCIConfigSubSystemID);
     uint16_t subsystem_vendor = sc->sc_pcitag->configRead16(kIOPCIConfigSubSystemVendorID);
     sc->sc_hw_id = (device << 16) + subsystem_device;
+    /*
+     * Publish the raw IDs before anything can fail: the two numbers that decide
+     * both table lookups are CSR_HW_REV_TYPE (mac_type) and CSR_HW_RFID_TYPE
+     * (rf_type), and "no config found" without them is unactionable.
+     */
+    sc->sc_diag_device = device;
+    sc->sc_diag_subdevice = subsystem_device;
+    sc->sc_diag_hw_rev = sc->sc_hw_rev;
+    sc->sc_diag_rf_id = sc->sc_hw_rf_id;
+    sc->sc_diag_mac_type = CSR_HW_REV_TYPE(sc->sc_hw_rev);
+    sc->sc_diag_rf_type = CSR_HW_RFID_TYPE(sc->sc_hw_rf_id);
+    iwx_publish_diag(sc);
+    iwx_diag_stage(sc, "cfg-match");
+    
     pci_match(PCI_VENDOR_INTEL, device, subsystem_vendor, subsystem_device, iwx_devices,
               nitems(iwx_devices), (void **)&com.sc_cfg_params);
     if (!com.sc_cfg_params) {
         XYLog("%s: Why??? unknown adapter type\n", DEVNAME(sc));
+        iwx_diag_fail(sc, "cfg-match", "no-trans-cfg");
         return false;
     }
     for (i = 0; i < ARRAY_SIZE(iwl_dev_info_table); i++) {
@@ -20191,6 +20539,11 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         XYLog("No config found for PCI dev %04x/%04x, rev=0x%x, rfid=0x%x\n",
               device, subsystem_device,
               sc->sc_hw_rev, sc->sc_hw_rf_id);
+        /*
+         * The usual cause is a mac_type/rf_type pair missing from
+         * iwl_dev_info_table; xe3-iwx-mactype and xe3-iwx-rftype now say which.
+         */
+        iwx_diag_fail(sc, "cfg-lookup", "no-dev-info-entry");
         return false;
     }
     XYLog("Found PCI dev %04x/%04x, rev=0x%x, rfid=0x%x fw: %s\n",
@@ -20198,6 +20551,11 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
           sc->sc_hw_rev, sc->sc_hw_rf_id, sc->sc_cfg->fwname);
     sc->sc_fwname = sc->sc_cfg->fwname;
     sc->sc_device_family = sc->sc_cfg->device_family;
+    sc->sc_diag_cfg_found = 1;
+    sc->sc_diag_cfg_name = sc->sc_cfg->name ? sc->sc_cfg->name : sc->sc_cfg->fwname;
+    sc->sc_diag_fw_name = sc->sc_cfg->fwname;
+    iwx_publish_diag(sc);
+    iwx_diag_stage(sc, "cfg-ok");
     sc->sc_integrated = sc->sc_cfg_params->integrated;
     sc->sc_ltr_delay = sc->sc_cfg_params->ltr_delay;
     sc->sc_low_latency_xtal = sc->sc_cfg_params->low_latency_xtal;
