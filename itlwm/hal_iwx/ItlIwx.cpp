@@ -285,6 +285,10 @@ detach(IOPCIDevice *device)
     iwx_dma_contig_free(&sc->prph_scratch_dma);
     iwx_dma_contig_free(&sc->iml_dma);
     iwx_dma_contig_free(&sc->pnvm_dram);
+    for (int i = 0; i < IWX_MAX_DRAM_ENTRY; i++)
+        iwx_dma_contig_free(&sc->pnvm_seg_dma[i]);
+    sc->pnvm_size = 0;
+    sc->pnvm_segs = 0;
     iwx_dma_contig_free(&sc->fw_mon);
     if (sc->sc_dmat)
         sc->sc_dmat->reclaim();
@@ -1357,7 +1361,30 @@ iwx_ctxt_info_gen3_init(struct iwx_softc *sc, const struct iwx_fw_sects *fws)
         iwx_write_umac_prph(sc, IWX_UREG_CPU_INIT_RUN, 1);
         iwx_nic_unlock(sc);
     }
-    
+
+    /*
+     * Baseline the RX ring's hardware index before the firmware can touch it.
+     *
+     * prph_info/boot_stage_mirror (sampled later, in iwx_load_firmware) only
+     * moves once the peripheral gets far enough to mirror its Boot Stage CSR
+     * into host DRAM. If the firmware is loaded but dies earlier, that mirror
+     * legitimately stays 0 and says nothing about whether the RX DMA engine
+     * was ever pointed at our ring. The RB status word is a different,
+     * independent witness: the FH writes it when it posts a packet to the
+     * ring, which is exactly how ALIVE is delivered. Comparing this baseline
+     * with the value read at publish time therefore separates "never wrote to
+     * the ring" from "wrote to the ring, interrupt lost".
+     */
+    sc->sc_diag_rxq_hw_kick = 0;
+    if (sc->rxq.stat != NULL) {
+        if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
+            sc->sc_diag_rxq_hw_kick =
+                le16toh(*(uint16_t *)(sc->rxq.stat)) & 0xfff;
+        else
+            sc->sc_diag_rxq_hw_kick =
+                le16toh(((struct iwx_rb_status *)sc->rxq.stat)->closed_rb_num) & 0xfff;
+    }
+
     return 0;
     
 fail1:
@@ -1786,6 +1813,27 @@ iwx_read_firmware(struct iwx_softc *sc)
                 /* ignore, not used by current driver */
                 break;
                 
+            /*
+             * PNVM payload embedded in the firmware image
+             * (IWL_UCODE_TLV_PNVM_DATA = 74, fw/file.h:109). Both Linux
+             * (fw/pnvm.c -> iwl_get_pnvm_image()) and OpenBSD
+             * (if_iwx.c:4392 "Prefer PNVM data embedded in firmware image")
+             * take the PNVM from here and only fall back to an external
+             * file. Keep a pointer into fw_rawdata: it is freed together
+             * with the image, so no extra copy is needed.
+             */
+            case IWX_UCODE_TLV_PNVM_DATA:
+                if (tlv_len < sizeof(struct iwx_sku_id)) {
+                    DPRINTF(("%s: PNVM_DATA too short (%u)\n",
+                             __func__, tlv_len));
+                    break;
+                }
+                fw->pnvm_embedded = (const uint8_t *)tlv_data;
+                fw->pnvm_embedded_len = tlv_len;
+                XYLog("%s: found embedded PNVM, %u bytes\n",
+                      __func__, tlv_len);
+                break;
+
             case IWX_UCODE_TLV_SEC_RT_USNIFFER:
                 err = iwx_firmware_store_section(sc,
                                                  IWX_UCODE_TYPE_REGULAR_USNIFFER, (uint8_t *)tlv_data,
@@ -2012,6 +2060,17 @@ iwx_read_firmware(struct iwx_softc *sc)
     sc->sc_diag_sect_len_total =
         (uint32_t)fw->fw_sects[IWX_UCODE_TYPE_REGULAR].fw_totlen;
     iwx_publish_diag(sc);
+    /*
+     * MLD firmware advertises MAC_CONF_GROUP (0x03) commands instead of
+     * MAC_CONTEXT/BINDING/ADD_STA.  OpenBSD restricts this to MAC_TYPE_MA or
+     * the BZ family; on this port family >= SC is the same set.
+     *
+     * Set here, not at attach time: the capability bits come from the TLV
+     * loop above, so this is the first point where the answer exists.
+     */
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT) &&
+        sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        sc->sc_use_mld_api = 1;
     
 parse_out:
     if (err) {
@@ -2040,15 +2099,133 @@ struct iwx_pnvm_section {
     const uint8_t data[];
 } __packed;
 
+/*
+ * Publish the PNVM payload to the firmware.
+ *
+ * The firmware tells us which layout it wants through
+ * IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG:
+ *
+ *   clear: one contiguous block. pnvm_base_addr => payload bytes.
+ *   set  : pnvm_base_addr => struct iwx_pnvm_info_dram, an array of one
+ *          physical address per payload section.
+ *
+ * Both layouts report the same pnvm_size (the sum of the section lengths),
+ * so pnvm_size alone cannot tell them apart - this is why the previous
+ * revision looked correct while handing the firmware an unmapped address.
+ *
+ * Linux: iwl_trans_pcie_ctx_info_v2_load_pnvm() (pcie/ctxt-info-v2.c:442)
+ * and iwl_trans_pcie_ctx_info_v2_set_pnvm() (:524).
+ */
+int ItlIwx::
+iwx_pnvm_setup(struct iwx_softc *sc, const uint8_t *const *pnvm_data,
+               const size_t *pnvm_size, int pnvm_segs)
+{
+    struct iwx_pnvm_info_dram *pnvm_info;
+    int i, err;
+
+    if (pnvm_segs <= 0 || pnvm_segs > IWX_MAX_DRAM_ENTRY) {
+        XYLog("%s: invalid PNVM segment count %d\n", DEVNAME(sc), pnvm_segs);
+        return -EINVAL;
+    }
+
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG)) {
+        /*
+         * Fragmented: one DRAM block per section plus a table of their
+         * physical addresses. The table is what pnvm_base_addr will point
+         * at, so it must be allocated and zeroed before the payloads.
+         */
+        XYLog("%s: PNVM fragmented layout, %d segments\n",
+              DEVNAME(sc), pnvm_segs);
+
+        iwx_dma_contig_free(&sc->pnvm_dram);
+        err = iwx_dma_contig_alloc(sc->sc_dmat, &sc->pnvm_dram,
+                                   sizeof(struct iwx_pnvm_info_dram), 0);
+        if (err) {
+            XYLog("%s: could not allocate PNVM address table\n", DEVNAME(sc));
+            return err;
+        }
+        memset(sc->pnvm_dram.vaddr, 0, sc->pnvm_dram.size);
+        pnvm_info = (struct iwx_pnvm_info_dram *)sc->pnvm_dram.vaddr;
+
+        /*
+         * Fresh counters: pnvm_size is accumulated per section below, so a
+         * stale value from an earlier attempt would double-count.
+         */
+        sc->pnvm_size = 0;
+        sc->pnvm_segs = 0;
+
+        for (i = 0; i < pnvm_segs; i++) {
+            err = iwx_dma_contig_alloc(sc->sc_dmat, &sc->pnvm_seg_dma[i],
+                                       pnvm_size[i], 0);
+            if (err) {
+                XYLog("%s: could not allocate PNVM segment %d\n",
+                      DEVNAME(sc), i);
+                goto fail;
+            }
+            memcpy(sc->pnvm_seg_dma[i].vaddr, pnvm_data[i], pnvm_size[i]);
+            pnvm_info->pnvm_img[i] = htole64(sc->pnvm_seg_dma[i].paddr);
+
+            sc->pnvm_size += pnvm_size[i];
+            sc->pnvm_segs++;
+        }
+
+        sc->sc_diag_pnvm_layout = 2;
+        sc->sc_diag_pnvm_segs = sc->pnvm_segs;
+
+        return 0;
+    }
+
+    /* Flat: concatenate every section into one block. */
+    {
+        size_t size = 0;
+        uint8_t *data;
+
+        XYLog("%s: PNVM flat layout, %d segments\n", DEVNAME(sc), pnvm_segs);
+
+        for (i = 0; i < pnvm_segs; i++)
+            size += pnvm_size[i];
+
+        iwx_dma_contig_free(&sc->pnvm_dram);
+        err = iwx_dma_contig_alloc(sc->sc_dmat, &sc->pnvm_dram, size, 0);
+        if (err) {
+            XYLog("%s: could not allocate PNVM block\n", DEVNAME(sc));
+            return err;
+        }
+
+        data = (uint8_t *)sc->pnvm_dram.vaddr;
+        for (i = 0; i < pnvm_segs; i++) {
+            memcpy(data, pnvm_data[i], pnvm_size[i]);
+            data += pnvm_size[i];
+        }
+        sc->pnvm_size = size;
+        sc->pnvm_segs = 0;
+
+        sc->sc_diag_pnvm_layout = 1;
+        sc->sc_diag_pnvm_segs = pnvm_segs;
+
+        return 0;
+    }
+
+fail:
+    for (i = 0; i < sc->pnvm_segs; i++)
+        iwx_dma_contig_free(&sc->pnvm_seg_dma[i]);
+    sc->pnvm_size = 0;
+    sc->pnvm_segs = 0;
+    iwx_dma_contig_free(&sc->pnvm_dram);
+
+    return err;
+}
+
 int ItlIwx::
 iwx_pnvm_handle_section(struct iwx_softc *sc, const uint8_t *data, size_t len)
 {
     struct iwx_ucode_tlv *tlv;
     uint32_t sha1 = 0;
     uint16_t mac_type = 0, rf_id = 0;
-    uint8_t *pnvm_data = NULL, *tmp;
+    const uint8_t *pnvm_data[IWX_MAX_DRAM_ENTRY];
+    size_t pnvm_size[IWX_MAX_DRAM_ENTRY];
+    int pnvm_segs = 0;
     bool hw_match = false;
-    uint32_t size = 0;
     int err = 0;
     struct iwx_prph_scratch_ctrl_cfg *prph_sc_ctrl;
     
@@ -2108,37 +2285,36 @@ iwx_pnvm_handle_section(struct iwx_softc *sc, const uint8_t *data, size_t len)
             case IWX_UCODE_TLV_SEC_RT: {
                 struct iwx_pnvm_section *section = (struct iwx_pnvm_section *)data;
                 u32 data_len = tlv_len - sizeof(*section);
-                
+
                 XYLog("Got IWL_UCODE_TLV_SEC_RT len %d\n",
                       tlv_len);
-                
+
                 /* TODO: remove, this is a deprecated separator */
                 if (le32_to_cpup((__le32 *)data) == 0xddddeeee) {
                     XYLog("Ignoring separator.\n");
                     break;
                 }
-                
-                XYLog("Adding data (size %d)\n",
-                      data_len);
-                
-                tmp = (uint8_t *)malloc(size + data_len, 0, 0);
-                if (!tmp) {
-                    XYLog("Couldn't allocate (more) pnvm_data\n");
-                    
-                    err = -ENOMEM;
+
+                if (pnvm_segs == IWX_MAX_DRAM_ENTRY) {
+                    XYLog("Too many PNVM payloads to fit in DRAM\n");
+                    err = -EINVAL;
                     goto out;
                 }
-                if (pnvm_data && size > 0) {
-                    memcpy(tmp, pnvm_data, size);
-                    ::free(pnvm_data);
-                }
-                
-                pnvm_data = tmp;
-                
-                memcpy(pnvm_data + size, section->data, data_len);
-                
-                size += data_len;
-                
+
+                XYLog("Adding data (size %d)\n",
+                      data_len);
+
+                /*
+                 * Keep every section as its own DRAM block instead of
+                 * concatenating them. The flat layout would let us merge
+                 * them, but the fragmented one needs them separate, and
+                 * iwx_pnvm_setup() is where the layout is chosen - so the
+                 * section boundaries have to survive until then.
+                 */
+                pnvm_size[pnvm_segs] = data_len;
+                pnvm_data[pnvm_segs] = section->data;
+                pnvm_segs++;
+
                 break;
             }
             case IWX_UCODE_TLV_PNVM_SKU:
@@ -2166,35 +2342,101 @@ done:
         goto out;
     }
 
-    if (!size) {
+    if (!pnvm_segs) {
         XYLog("Empty PNVM, skipping.\n");
         err = -ENOENT;
         goto out;
     }
-    
+
     XYLog("loaded PNVM version %08x\n", sha1);
-    
+
     prph_sc_ctrl = &((struct iwx_prph_scratch *)sc->prph_scratch_dma.vaddr)->ctrl_cfg;
-    
-    iwx_dma_contig_free(&sc->pnvm_dram);
-    err = iwx_dma_contig_alloc(sc->sc_dmat, &sc->pnvm_dram, size, 0);
-    if (err) {
-        XYLog("%s: could not allocate context info DMA memory\n",
-              DEVNAME(sc));
+
+    err = iwx_pnvm_setup(sc, pnvm_data, pnvm_size, pnvm_segs);
+    if (err)
         goto out;
-    }
-    
-    memcpy(sc->pnvm_dram.vaddr, pnvm_data, size);
-    
+
+    /*
+     * With the fragmented layout pnvm_dram holds the address table, not the
+     * payload - that is exactly what the firmware asked for, so publish it
+     * either way.
+     */
     prph_sc_ctrl->pnvm_cfg.pnvm_base_addr =
         htole64(sc->pnvm_dram.paddr);
     prph_sc_ctrl->pnvm_cfg.pnvm_size =
-        htole32(sc->pnvm_dram.size);
-    
+        htole32(sc->pnvm_size);
+
 out:
-    ::free(pnvm_data);
-    
     return err;
+}
+
+int ItlIwx::
+iwx_pnvm_parse(struct iwx_softc *sc, const uint8_t *data, size_t len)
+{
+    struct iwx_ucode_tlv *tlv;
+    
+    /*
+     * Outer PNVM container parser: walk the TLV list, and for every
+     * IWX_UCODE_TLV_PNVM_SKU segment compare its SKU id against the one the
+     * firmware reported in the ALIVE response. On a match, hand the REST of
+     * the buffer to iwx_pnvm_handle_section(), which then starts at
+     * IWX_UCODE_TLV_HW_TYPE and can therefore set hw_match.
+     *
+     * This layer is not optional. iwx_pnvm_handle_section() treats a leading
+     * IWX_UCODE_TLV_PNVM_SKU as "a new section starts here, stop parsing"
+     * and jumps to done with hw_match still false -> -ENOENT. That is exactly
+     * what the SC image triggers when the payload is passed in whole, because
+     * its first sub-TLV at offset 0 IS the SKU (verified byte by byte:
+     * type=64 len=12, then type=58 len=12 for HW_TYPE, then type=62 len=4,
+     * then the SEC_RT type=19 segments).
+     *
+     * Linux (fw/pnvm.c:194-232) and OpenBSD (if_iwx.c:4310-4341) both have
+     * this same two-level split; the SKU bytes are consumed by the outer loop
+     * (data += sizeof(*tlv) + ALIGN(tlv_len, 4)) before handle_section runs.
+     * Driving handle_section directly was the reason pnvm_cfg.pnvm_size
+     * stayed 0 while the firmware still answered PNVM_INIT_COMPLETE.
+     */
+    while (len >= sizeof(*tlv)) {
+        uint32_t tlv_len, tlv_type;
+        
+        len -= sizeof(*tlv);
+        tlv = (struct iwx_ucode_tlv *)data;
+        
+        tlv_len = le32toh(tlv->length);
+        tlv_type = le32toh(tlv->type);
+        
+        if (len < tlv_len || roundup(tlv_len, 4) > len) {
+            XYLog("invalid TLV len: %zd/%u\n", len, tlv_len);
+            return EINVAL;
+        }
+        
+        if (tlv_type == IWX_UCODE_TLV_PNVM_SKU) {
+            struct iwx_sku_id *sku_id =
+                (struct iwx_sku_id *)(data + sizeof(*tlv));
+            
+            XYLog("Got IWL_UCODE_TLV_PNVM_SKU len %d\n", tlv_len);
+            XYLog("sku_id 0x%0x 0x%0x 0x%0x\n",
+                  le32toh(sku_id->data[0]),
+                  le32toh(sku_id->data[1]),
+                  le32toh(sku_id->data[2]));
+            
+            data += sizeof(*tlv) + roundup(tlv_len, 4);
+            len -= roundup(tlv_len, 4);
+            
+            if (sc->sku_id[0] == le32toh(sku_id->data[0]) &&
+                sc->sku_id[1] == le32toh(sku_id->data[1]) &&
+                sc->sku_id[2] == le32toh(sku_id->data[2]) &&
+                iwx_pnvm_handle_section(sc, data, len) == 0)
+                return 0;
+            else
+                XYLog("SKU ID didn't match!\n");
+        } else {
+            data += sizeof(*tlv) + roundup(tlv_len, 4);
+            len -= roundup(tlv_len, 4);
+        }
+    }
+    
+    return ENOENT;
 }
 
 int ItlIwx::
@@ -2205,9 +2447,6 @@ iwx_read_pnvm(struct iwx_softc *sc)
     struct iwx_fw_info *fw = &sc->sc_fw;
     char fwname_copy[64];
     char pnvm_name[64];
-    struct iwx_ucode_tlv *tlv;
-    uint8_t *data;
-    size_t len;
     const char *find;
     
     if (fw->pnvm_rawdata != NULL)
@@ -2226,7 +2465,17 @@ iwx_read_pnvm(struct iwx_softc *sc)
      */
     if (sc->sc_fwname == NULL || sizeof(fwname_copy) < strlen(sc->sc_fwname) + 1)
         goto out;
-    memcpy(fwname_copy, sc->sc_fwname, sizeof(fwname_copy));
+    /*
+     * Copy strlen+1, NOT sizeof(fwname_copy). sc_fwname is a NUL-terminated
+     * string literal living in __TEXT/__cstring; reading sizeof(dst) bytes out
+     * of it runs past the end of the literal and, once the 29-byte name ends
+     * near a page boundary, crosses into an unmapped page -> page fault
+     * (kernel trap type 14) inside iwx_read_pnvm. Verified on the real machine:
+     *   iwx_read_pnvm+0x1fe <- iwx_load_pnvm+0x95 <- iwx_load_ucode_wait_alive
+     *   <- iwx_preinit+0x1a6 <- iwx_attach+0x2106
+     * The size is already validated by the check above, so strlen+1 fits.
+     */
+    memcpy(fwname_copy, sc->sc_fwname, strlen(sc->sc_fwname) + 1);
     find = strrchr(sc->sc_fwname, '-');
     if (!find)
         goto out;
@@ -2251,54 +2500,7 @@ iwx_read_pnvm(struct iwx_softc *sc)
     
     XYLog("Parsing PNVM file\n");
     
-    data = (uint8_t *)fw->pnvm_rawdata;
-    len = fw->pnvm_rawsize;
-    
-    while (len >= sizeof(*tlv)) {
-        uint32_t tlv_len, tlv_type;
-
-        len -= sizeof(*tlv);
-        tlv = (struct iwx_ucode_tlv *)data;
-
-        tlv_len = le32toh(tlv->length);
-        tlv_type = le32toh(tlv->type);
-
-        if (len < tlv_len || roundup(tlv_len, 4) > len) {
-            XYLog("invalid TLV len: %zd/%u\n",
-                len, tlv_len);
-            err = -EINVAL;
-            goto out;
-        }
-
-        if (tlv_type == IWX_UCODE_TLV_PNVM_SKU) {
-            struct iwx_sku_id *sku_id =
-                (struct iwx_sku_id *)(data + sizeof(*tlv));
-
-            XYLog("Got IWL_UCODE_TLV_PNVM_SKU len %d\n",
-                     tlv_len);
-            XYLog("sku_id 0x%0x 0x%0x 0x%0x\n",
-                     le32toh(sku_id->data[0]),
-                     le32toh(sku_id->data[1]),
-                     le32toh(sku_id->data[2]));
-
-            data += sizeof(*tlv) + roundup(tlv_len, 4);
-            len -= roundup(tlv_len, 4);
-
-            if (sc->sku_id[0] == le32toh(sku_id->data[0]) &&
-                sc->sku_id[1] == le32toh(sku_id->data[1]) &&
-                sc->sku_id[2] == le32toh(sku_id->data[2])) {
-
-                err = iwx_pnvm_handle_section(sc, data, len);
-                if (!err)
-                    goto out;
-            } else {
-                XYLog("SKU ID didn't match!\n");
-            }
-        } else {
-            data += sizeof(*tlv) + roundup(tlv_len, 4);
-            len -= roundup(tlv_len, 4);
-        }
-    }
+    err = iwx_pnvm_parse(sc, (uint8_t *)fw->pnvm_rawdata, fw->pnvm_rawsize);
     
     XYLog("PNVM parse done\n");
     
@@ -2322,27 +2524,74 @@ iwx_load_pnvm(struct iwx_softc *sc)
     }
     
     /*
-     * A PNVM image is optional for the driver's own bring-up: Linux
-     * iwl_pnvm_load_pnvm_to_trans() logs "PNVM is not available" and returns 0
-     * when the file is missing, and this card has no sc-a0 PNVM anywhere in
-     * linux-firmware. Treating a missing image as fatal instead produced a
-     * 2 s IWX_PNVM_COMPLETE timeout (ETIMEDOUT) that aborted the whole
-     * INIT image load. Skipping the notification is only safe because no PNVM
-     * was sent, so the firmware has nothing to acknowledge.
+     * Take the PNVM from the firmware image first.
+     *
+     * The SC image carries a 55128-byte PNVM payload in
+     * IWL_UCODE_TLV_PNVM_DATA (74); iwx_firmware_store_section() now records
+     * it in sc_fw.pnvm_embedded. OpenBSD states the priority explicitly:
+     * "Prefer PNVM data embedded in firmware image" (if_iwx.c:4392), and
+     * Linux does the same through iwl_get_pnvm_image() over fw->pnvm_data.
+     *
+     * this driver previously only called iwx_read_pnvm(), which looks for an
+     * external iwlwifi-sc-a0-gf-a0.pnvm that does not exist in
+     * linux-firmware, so the embedded payload was never used, pnvm_size
+     * stayed 0 and the PNVM handshake below was skipped entirely.
      */
-    err = iwx_read_pnvm(sc);
-    if (err) {
-        XYLog("%s: no PNVM image (%d), continuing without it\n",
-              DEVNAME(sc), err);
-        sc->sc_diag_pnvm = "absent-skipped";
-        iwx_publish_diag(sc);
-        sc->sc_init_complete &= ~IWX_PNVM_COMPLETE;
-        iwx_pnvm_free(&sc->sc_fw);
-        return 0;
+    if (sc->sc_fw.pnvm_embedded != NULL && sc->sc_fw.pnvm_embedded_len > 0) {
+        XYLog("%s: using embedded PNVM (%zu bytes)\n",
+              __func__, sc->sc_fw.pnvm_embedded_len);
+        /*
+         * iwx_pnvm_parse(), not iwx_pnvm_handle_section(): the embedded
+         * payload is the whole PNVM container and starts with
+         * IWX_UCODE_TLV_PNVM_SKU(64). handle_section() reads a leading SKU as
+         * "new section starts, stop parsing" and returns -ENOENT with
+         * hw_match still false, leaving pnvm_cfg.pnvm_size at 0 - which is
+         * how the firmware ends up answering PNVM_INIT_COMPLETE but never
+         * issuing INIT_COMPLETE. The SKU must be matched and consumed by the
+         * outer loop first, exactly as Linux (fw/pnvm.c:194-232) and OpenBSD
+         * (if_iwx.c:4310-4341) do.
+         */
+        err = iwx_pnvm_parse(sc, sc->sc_fw.pnvm_embedded,
+                             sc->sc_fw.pnvm_embedded_len);
+        if (err) {
+            XYLog("%s: embedded PNVM parse failed (%d)\n",
+                  DEVNAME(sc), err);
+        }
+    } else {
+        err = iwx_read_pnvm(sc);
+        if (err) {
+            XYLog("%s: no PNVM image (%d)\n", DEVNAME(sc), err);
+        }
     }
-    sc->sc_diag_pnvm = "found";
-    iwx_publish_diag(sc);
-    
+
+    /*
+     * Kick the doorbell even when no PNVM image was available.
+     *
+     * UREG_DOORBELL_TO_ISR6_PNVM is a "proceed" signal, not a data pointer:
+     * the payload address/length travel through
+     * prph_scratch.ctrl_cfg.pnvm_cfg, which stays all-zero when there is no
+     * image. OpenBSD spells the intent out - "If we don't have a platform
+     * NVM file simply ask firmware to proceed without it"
+     * (if_iwx.c:4426-4432) - and Linux kicks it unconditionally once sku_id
+     * is non-zero (fw/pnvm.c:474-476), even though
+     * iwl_pnvm_load_pnvm_to_trans() may have bailed out internally because
+     * the file was missing (:376-380).
+     *
+     * Returning early here without the handshake left the firmware parked
+     * after ALIVE: INIT_EXTENDED_CFG (WIDE_ID(0x02,0x03)) then timed out at
+     * 1 s with EWOULDBLOCK, no interrupt was raised afterwards, the RX
+     * hardware index stayed at 4, the MSI-X cause registers read 0 and the
+     * ICT table was all zero.
+     */
+    if (err) {
+        sc->sc_diag_pnvm = "absent-handshake";
+        iwx_publish_diag(sc);
+        iwx_pnvm_free(&sc->sc_fw);
+    } else {
+        sc->sc_diag_pnvm = "found";
+        iwx_publish_diag(sc);
+    }
+
 out:
     sc->sc_init_complete &= ~IWX_PNVM_COMPLETE;
     /* kick the doorbell */
@@ -2350,15 +2599,87 @@ out:
         iwx_write_umac_prph(sc, IWX_UREG_DOORBELL_TO_ISR6,
         IWX_UREG_DOORBELL_TO_ISR6_PNVM);
         iwx_nic_unlock(sc);
+    } else {
+        XYLog("%s: could not take nic lock for the PNVM doorbell\n",
+              DEVNAME(sc));
+        iwx_pnvm_free(&sc->sc_fw);
+        /*
+         * Same diagnostic-deviation rule as the wait below: do not abort the
+         * init sequence here either, so the remaining readings stay
+         * observable. The missing doorbell is obvious from
+         * sc_diag_pnvm_wait_err (the wait will time out) and from the log.
+         */
+        sc->sc_diag_pnvm_wait_err = EBUSY;
+        iwx_publish_diag(sc);
+        return 0;
     }
     
-    err = iwx_wait_notification(sc, &sc->sc_init_complete, IWX_PNVM_COMPLETE, 2000);
+    /*
+     * ONE budget regardless of whether a payload was found.
+     *
+     * The wait is on the firmware's answer, not on what the host happens to
+     * have in hand: pnvm_absent only means pnvm_cfg is all-zero, i.e. the
+     * firmware has no tables to install - it says nothing about how fast the
+     * firmware acknowledges the doorbell. Neither upstream varies the budget
+     * this way: Linux uses MVM_UCODE_PNVM_TIMEOUT (fw/pnvm.h, 250 ms) and
+     * OpenBSD uses 2 s (if_iwx.c:4437), both unconditionally.
+     *
+     * The previous revision had `pnvm_absent ? 250 : 2000`, which meant that
+     * the moment iwx_pnvm_parse() started succeeding the budget quadrupled
+     * AND the "swallow the error" branch below stopped applying - a
+     * behaviour change nobody asked for, and the direct cause of the
+     * all-sentinel xd3 regression (iwx_load_pnvm returns 35 ->
+     * iwx_load_ucode_wait_alive :5786 -> iwx_run_init_mvm_ucode :5820 ->
+     * return before :5830, so nothing downstream is observable).
+     */
+    err = iwx_wait_notification(sc, &sc->sc_init_complete, IWX_PNVM_COMPLETE,
+                                2000);
+    sc->sc_diag_pnvm_wait_err = err;
+    iwx_publish_diag(sc);
     if (err == ENXIO)
         return err;
-    
+
+    /*
+     * Sample pnvm_cfg NOW, not only on the INIT_COMPLETE failure path.
+     *
+     * This is the only direct evidence of whether the PNVM payload actually
+     * reached the firmware: prph_scratch.ctrl_cfg.pnvm_cfg is the sole
+     * channel that carries the address and length. Sampling it only in
+     * iwx_run_init_mvm_ucode()'s timeout branch (:5936) meant that whenever
+     * anything upstream aborted, xd3's p/q stayed at their initialisers and
+     * could not distinguish "never written" from "written but unread".
+     */
+    if (sc->prph_scratch_dma.vaddr != NULL) {
+        struct iwx_prph_scratch_ctrl_cfg *cfg =
+            &((struct iwx_prph_scratch *)sc->prph_scratch_dma.vaddr)->ctrl_cfg;
+        sc->sc_diag_pnvm_size = le32toh(cfg->pnvm_cfg.pnvm_size);
+        sc->sc_diag_pnvm_addr_ok =
+            (le64toh(cfg->pnvm_cfg.pnvm_base_addr) != 0);
+        iwx_publish_diag(sc);
+    }
+
     iwx_pnvm_free(&sc->sc_fw);
-    
-    return err;
+
+    /*
+     * DIAGNOSTIC DEVIATION from both upstreams - deliberately not fatal.
+     *
+     * Linux aborts the whole init on a PNVM timeout (mvm/fw.c:407-413, the
+     * caller never reaches INIT_EXTENDED_CFG at :655) and so does OpenBSD
+     * (if_iwx.c:4445 -> :4499-4503). That is the correct production
+     * behaviour and it must be restored once INIT works.
+     *
+     * For now the abort costs every reading downstream of it: the return
+     * value propagates to iwx_run_init_mvm_ucode():5820, which is before
+     * :5830, so i/n/b/w all stay at 0x7fffffff/-1 and one boot tells us
+     * nothing about pnvm_cfg, INIT_EXTENDED_CFG or INIT_COMPLETE. Since the
+     * whole point of this build is to find out WHY the firmware goes quiet
+     * with a payload present, keep going, log loudly, and let
+     * sc_diag_pnvm_wait_err carry the truth.
+     */
+    if (err)
+        XYLog("%s: PNVM handshake returned %d, continuing to "
+              "INIT_EXTENDED_CFG (diagnostic deviation)\n", DEVNAME(sc), err);
+    return 0;
 }
 
 static uint32_t iwx_prph_msk(struct iwx_softc *sc)
@@ -3040,6 +3361,39 @@ iwx_free_tx_ring(struct iwx_softc *sc, struct iwx_tx_ring *ring)
 }
 
 void ItlIwx::
+iwx_note_intmask(struct iwx_softc *sc, const char *tag, uint32_t want)
+{
+    /*
+     * Write CSR_INT_MASK and read it straight back.
+     *
+     * The register is 0x00c (if_iwxreg.h:580). Bit 31 is CSR_INT_BIT_FH_RX, the
+     * only bit that can carry the ALIVE notification on this part: Linux
+     * documents ALIVE as arriving on FH RX ("Alive notification via Rx
+     * interrupt will do the real work", pcie/rx.c:2005) and arms exactly
+     * ALIVE|FH_RX while loading firmware (pcie/internal.h:1045-1047).
+     *
+     * The reason for a dedicated helper is that the three values this driver
+     * ever assigns to sc_intmask are 0x80, 0xba0000cb and 0x80000001 - none of
+     * them is 0x1 - so a readback of 0x1 cannot come from our own software
+     * state. Sampling immediately after the write, before any interrupt can
+     * fire, separates the two remaining explanations:
+     *   want == rb  -> the hardware latched bit 31; a later 0x1 readback came
+     *                  from something else (a subsequent write, or a read of a
+     *                  different window).
+     *   want != rb  -> the hardware dropped bit 31. On Bz/SC that is expected
+     *                  if the function is in MSI mode: Linux only ever arms
+     *                  FH_RX through CSR_INT_MASK when !msix_enabled, and
+     *                  Bz/SC always takes MSI-X because mq_rx_supported is set
+     *                  (cfg/sc.c) and iwl_pcie_set_interrupt_capa() only falls
+     *                  back to MSI when pci_enable_msix_range() fails.
+     */
+    IWX_WRITE(sc, IWX_CSR_INT_MASK, want);
+    sc->sc_diag_int_mask_want = want;
+    sc->sc_diag_int_mask_rb = IWX_READ(sc, IWX_CSR_INT_MASK);
+    sc->sc_diag_int_mask_tag = tag;
+}
+
+void ItlIwx::
 iwx_enable_rfkill_int(struct iwx_softc *sc)
 {
     if (!sc->sc_msix) {
@@ -3110,11 +3464,10 @@ iwx_enable_interrupts(struct iwx_softc *sc)
 void ItlIwx::
 iwx_enable_fwload_interrupt(struct iwx_softc *sc)
 {
-    
     XYLog("%s\n", __FUNCTION__);
     if (!sc->sc_msix) {
         sc->sc_intmask = IWX_CSR_INT_BIT_ALIVE | IWX_CSR_INT_BIT_FH_RX;
-        IWX_WRITE(sc, IWX_CSR_INT_MASK, sc->sc_intmask);
+        iwx_note_intmask(sc, "fwload", sc->sc_intmask);
     } else {
         IWX_WRITE(sc, IWX_CSR_MSIX_HW_INT_MASK_AD,
                   ~IWX_MSIX_HW_INT_CAUSES_REG_ALIVE);
@@ -3132,7 +3485,15 @@ iwx_enable_fwload_interrupt(struct iwx_softc *sc)
 void ItlIwx::
 iwx_restore_interrupts(struct iwx_softc *sc)
 {
-    IWX_WRITE(sc, IWX_CSR_INT_MASK, sc->sc_intmask);
+    iwx_note_intmask(sc, "restore", sc->sc_intmask);
+    /*
+     * Diagnostic, second of the two int-mask samples: read the register back
+     * after re-arming. intrFilter() already stored the value that was armed
+     * when the interrupt arrived; if this read-back comes back non-zero the
+     * re-arm stuck, and if the published value is ever 0 the device was left
+     * deaf by an early exit in iwx_intr() (or the write did not stick).
+     */
+    sc->sc_diag_int_mask = IWX_READ(sc, IWX_CSR_INT_MASK);
 }
 
 void ItlIwx::
@@ -3159,6 +3520,7 @@ iwx_disable_interrupts(struct iwx_softc *sc)
 void ItlIwx::
 iwx_ict_reset(struct iwx_softc *sc)
 {
+    sc->sc_diag_ict_reset_called++;
     iwx_disable_interrupts(sc);
     
     memset(sc->ict_dma.vaddr, 0, IWX_ICT_SIZE);
@@ -3644,6 +4006,10 @@ iwx_stop_device(struct iwx_softc *sc)
     iwx_dma_contig_free(&sc->prph_scratch_dma);
     iwx_dma_contig_free(&sc->iml_dma);
     iwx_dma_contig_free(&sc->pnvm_dram);
+    for (int i = 0; i < IWX_MAX_DRAM_ENTRY; i++)
+        iwx_dma_contig_free(&sc->pnvm_seg_dma[i]);
+    sc->pnvm_size = 0;
+    sc->pnvm_segs = 0;
 #ifdef AIRPORT_VTD
     sc->sc_dmat->reclaim();
 #endif
@@ -3742,6 +4108,19 @@ const uint8_t iwx_ac_to_tx_fifo[] = {
     IWX_GEN2_EDCA_TX_FIFO_VO,
 };
 
+/*
+ * Bz/SC EDCA FIFO mapping (BE, BK, VI, VO order, same as iwx_ac_to_tx_fifo).
+ * These chips dropped the dedicated CMD FIFO, so the four AC FIFOs start at
+ * zero and the GEN2 numbering (which reserves slot 0 for commands) would leave
+ * LINK_CONFIG_CMD's ac[] table shifted by one.
+ */
+static const uint8_t iwx_ac_to_bz_tx_fifo[] = {
+    IWX_BZ_EDCA_TX_FIFO_BE,
+    IWX_BZ_EDCA_TX_FIFO_BK,
+    IWX_BZ_EDCA_TX_FIFO_VI,
+    IWX_BZ_EDCA_TX_FIFO_VO,
+};
+
 int ItlIwx::
 iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
                int num_slots)
@@ -3749,30 +4128,57 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     
     XYLog("%s\n", __FUNCTION__);
     struct iwx_tx_queue_cfg_cmd cmd;
+    struct iwx_scd_queue_cfg_cmd cmd_v3;
     struct iwx_rx_packet *pkt;
     struct iwx_tx_queue_cfg_rsp *resp;
     struct iwx_host_cmd hcmd = {
-        .id = IWX_SCD_QUEUE_CFG,
         .flags = IWX_CMD_WANT_RESP,
         .resp_pkt_len = sizeof(*pkt) + sizeof(*resp),
     };
     struct iwx_tx_ring *ring = &sc->txq[qid];
-    int err, fwqid;
+    int err, fwqid, cmd_ver;
     uint32_t wr_idx;
     size_t resp_len;
     
     iwx_reset_tx_ring(sc, ring);
     
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.sta_id = sta_id;
-    cmd.tid = tid;
-    cmd.flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE);
-    cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
-    cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
-    cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
-    
-    hcmd.data[0] = &cmd;
-    hcmd.len[0] = sizeof(cmd);
+    /*
+     * Pick the scheduler-queue command by firmware capability, exactly like
+     * OpenBSD (ob-if_iwx.c:2932-2961).  sc-a0 declares
+     * (DATA_PATH_GROUP, SCD_QUEUE_CONFIG_CMD) = v3 and answers nothing for
+     * the legacy (LONG_GROUP, SCD_QUEUE_CFG) struct, so the old path is only
+     * a fallback for firmware that does not advertise the new command.
+     */
+    cmd_ver = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
+                                 IWX_SCD_QUEUE_CONFIG_CMD);
+    if (cmd_ver == 3) {
+        memset(&cmd_v3, 0, sizeof(cmd_v3));
+        cmd_v3.operation = htole32(IWX_SCD_QUEUE_ADD);
+        cmd_v3.u.add.tfdq_dram_addr = htole64(ring->desc_dma.paddr);
+        cmd_v3.u.add.bc_dram_addr = htole64(ring->bc_tbl.paddr);
+        cmd_v3.u.add.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
+        cmd_v3.u.add.flags = htole32(0);
+        cmd_v3.u.add.sta_mask = htole32(1 << sta_id);
+        cmd_v3.u.add.tid = (uint8_t)tid;
+        hcmd.id = IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD);
+        hcmd.data[0] = &cmd_v3;
+        hcmd.len[0] = sizeof(cmd_v3);
+    } else if (cmd_ver == 0 || cmd_ver == IWX_FW_CMD_VER_UNKNOWN) {
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.sta_id = sta_id;
+        cmd.tid = tid;
+        cmd.flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE);
+        cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
+        cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
+        cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
+        hcmd.id = IWX_SCD_QUEUE_CFG;
+        hcmd.data[0] = &cmd;
+        hcmd.len[0] = sizeof(cmd);
+    } else {
+        XYLog("%s: unsupported SCD_QUEUE_CFG command version %d\n",
+              DEVNAME(sc), cmd_ver);
+        return ENOTSUP;
+    }
     
     err = iwx_send_cmd(sc, &hcmd);
     if (err)
@@ -3796,11 +4202,40 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     fwqid = le16toh(resp->queue_number);
     wr_idx = le16toh(resp->write_pointer);
     
-    /* Unlike iwlwifi, we do not support dynamic queue ID assignment. */
+    /*
+     * Queue numbers are assigned by the firmware, not requested by the host:
+     * the SCD_QUEUE_CONFIG_CMD v3 layout carries no "requested qid" at all
+     * (only sta_mask / tid / cb_size / the two DMA addresses), and Linux simply
+     * adopts the answer -- iwl_pcie_txq_alloc_response() (pcie/tx-gen2.c:963-1004)
+     * stores rsp->queue_number into txq->id without comparing it to anything.
+     * OpenBSD keeps the mismatch fatal ("Unlike iwlwifi, we do not support
+     * dynamic queue ID assignment"), which is safe there only because it asks
+     * for exactly the number the firmware hands out.
+     *
+     * On SC the two used to disagree: iwx_enable_mgmt_queue() asked for queue 2
+     * (pre-SC aux-station layout) and the firmware assigned 1.  That is fixed at
+     * the source, but adopt the firmware's answer for the management queue as a
+     * safety net so a residual mismatch degrades to a log line instead of a
+     * dead join.  Everything else (legacy queue cfg, aux/monitor paths) keeps
+     * the original strict check.
+     */
     if (fwqid != qid) {
-        DPRINTF(("requested qid %d but %d was assigned\n", qid, fwqid));
-        err = EIO;
-        goto out;
+        if (cmd_ver == 3 && sta_id == IWX_STATION_ID && tid == IWX_MGMT_TID &&
+            fwqid > IWX_DQA_CMD_QUEUE && fwqid < (int)nitems(sc->txq)) {
+            XYLog("%s: firmware assigned TX queue %d (requested %d), adopting\n",
+                  DEVNAME(sc), fwqid, qid);
+            /*
+             * hdr_wide.qid and HBUS_TARG_WRPTR are built from ring->qid, so the
+             * ring has to carry the firmware's number.  The ring itself stays
+             * where it was allocated (sc->first_data_qid is the host index used
+             * by iwx_tx() to find it) and the unused slot keeps its DMA.
+             */
+            ring->qid = fwqid;
+        } else {
+            DPRINTF(("requested qid %d but %d was assigned\n", qid, fwqid));
+            err = EIO;
+            goto out;
+        }
     }
     
     if (wr_idx != ring->cur) {
@@ -3808,6 +4243,9 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
         err = EIO;
         goto out;
     }
+    
+    XYLog("%s: TX queue %d enabled (requested %d, tid %d, slots %d)\n",
+          DEVNAME(sc), ring->qid, qid, tid, num_slots);
 out:
     iwx_free_resp(sc, &hcmd);
     return err;
@@ -4121,7 +4559,32 @@ iwx_post_alive(struct iwx_softc *sc)
 {
     
     XYLog("%s\n", __FUNCTION__);
-    iwx_ict_reset(sc);
+    /*
+     * Do NOT touch CSR_DRAM_INT_TBL_REG when running on MSI-X.
+     *
+     * iwx_ict_reset() writes that register with CSR_DRAM_INT_TBL_ENABLE
+     * (bit 31) and switches the driver's legacy handler to ICT mode. On
+     * MSI-X that register must be left alone: Linux only ever allocates the
+     * ICT table in the non-msix branch of iwl_trans_pcie_alloc()
+     * (pcie/gen1_2/trans.c:3911-3917) and iwl_pcie_reset_ict() returns
+     * immediately when ict_tbl is NULL (pcie/gen1_2/rx.c:2218-2219), so
+     * the register is never written on a MSI-X device. Its counterpart
+     * iwl_trans_pcie_fw_alive() (pcie/gen1_2/trans.c:1373-1376) only looks
+     * like it does a reset - it is a no-op there.
+     *
+     * itlwm instead allocates ict_dma unconditionally (ItlIwx.cpp:21195),
+     * so iwx_ict_reset() really does program the hardware. On this SC
+     * device that left bit 31 set with sc_msix == 1 and the firmware
+     * stopped delivering any cause: CSR_MSIX_FH_INT_CAUSES_AD and
+     * CSR_MSIX_HW_INT_CAUSES_AD both read 0, the RX hardware index froze
+     * at 4 and the INIT_EXTENDED_CFG ack never arrived (measured, see
+     * xd5 = "fh=0x0 hw=0x0 am=0x0 h2=4 c2=4").
+     *
+     * iwx_enable_interrupts() below restores the full MSI-X mask on its
+     * own, so skipping the reset loses nothing there.
+     */
+    if (!sc->sc_msix)
+        iwx_ict_reset(sc);
     
     /*
      * Re-enable all the interrupts, including the RF-Kill one, now that
@@ -5168,12 +5631,24 @@ int ItlIwx::
 iwx_set_mac_addr_from_csr(struct iwx_softc *sc, struct iwx_nvm_data *data)
 {
     uint32_t mac_addr0, mac_addr1;
-    
-    if (!iwx_nic_lock(sc))
+    int base = sc->sc_mac_addr_from_csr;
+
+    /*
+     * Zero it first, exactly as OpenBSD does (if_iwx.c:3924). Without this
+     * the caller's struct is whatever it happened to hold, so a failed read
+     * could still look like a valid address.
+     */
+    memset(data->hw_addr, 0, sizeof(data->hw_addr));
+
+    if (!iwx_nic_lock(sc)) {
+        sc->sc_diag_nvm_mac = 0xffffff;
+        sc->sc_diag_nvm_err = EBUSY;
+        iwx_publish_diag(sc);
         return EBUSY;
+    }
     
-    mac_addr0 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR0_STRAP));
-    mac_addr1 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR1_STRAP));
+    mac_addr0 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR0_STRAP(base)));
+    mac_addr1 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR1_STRAP(base)));
     
     iwx_flip_hw_address(mac_addr0, mac_addr1, data->hw_addr);
     
@@ -5184,13 +5659,16 @@ iwx_set_mac_addr_from_csr(struct iwx_softc *sc, struct iwx_nvm_data *data)
     if (iwx_is_valid_mac_addr(data->hw_addr))
         goto done;
     
-    mac_addr0 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR0_OTP));
-    mac_addr1 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR1_OTP));
+    mac_addr0 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR0_OTP(base)));
+    mac_addr1 = htole32(IWX_READ(sc, IWX_CSR_MAC_ADDR1_OTP(base)));
     
     iwx_flip_hw_address(mac_addr0, mac_addr1, data->hw_addr);
     
 done:
-    
+    sc->sc_diag_nvm_mac = ((int)data->hw_addr[0] << 16) |
+                          ((int)data->hw_addr[1] << 8) |
+                          (int)data->hw_addr[2];
+
     iwx_nic_unlock(sc);
     return 0;
 }
@@ -5198,7 +5676,20 @@ done:
 int ItlIwx::
 iwx_is_valid_mac_addr(const uint8_t *addr)
 {
-    return (memcmp(etherbroadcastaddr, addr, sizeof(etherbroadcastaddr)) != 0 &&
+    /*
+     * 02:cc:aa:ff:ee:00 is the address the firmware reports when nothing has
+     * been provisioned. Both upstreams reject it explicitly:
+     *   Linux  : iwl_is_valid_mac_addr() -> IWL_IS_VALID_MAC_ADDR reserved check
+     *   OpenBSD: if_iwx.c:3949-3959 reserved_mac[]
+     * Without this the zeroed-out (or unreadable) MAC block could still pass
+     * the three generic checks and let iwx_nvm_get() continue with garbage.
+     */
+    static const uint8_t reserved_mac[] = {
+        0x02, 0xcc, 0xaa, 0xff, 0xee, 0x00
+    };
+
+    return (memcmp(reserved_mac, addr, ETHER_ADDR_LEN) != 0 &&
+            memcmp(etherbroadcastaddr, addr, sizeof(etherbroadcastaddr)) != 0 &&
             memcmp(etheranyaddr, addr, sizeof(etheranyaddr)) != 0 &&
             !ETHER_IS_MULTICAST(addr));
 }
@@ -5229,11 +5720,21 @@ iwx_nvm_get(struct iwx_softc *sc)
     size_t resp_len = v4 ? sizeof(*rsp) : sizeof(*rsp_v3);
     
     hcmd.resp_pkt_len = sizeof(struct iwx_rx_packet) + resp_len;
+    sc->sc_diag_nvm_v4 = v4;
+    sc->sc_diag_nvm_expect_len = (int)resp_len;
     err = iwx_send_cmd(sc, &hcmd);
-    if (err)
+    if (err) {
+        sc->sc_diag_nvm_err = err;
+        sc->sc_diag_nvm_actual_len = -1;
+        iwx_publish_diag(sc);
         return err;
-    
+    }
+
+    sc->sc_diag_nvm_actual_len =
+        (int)iwx_rx_packet_payload_len(hcmd.resp_pkt);
     if (iwx_rx_packet_payload_len(hcmd.resp_pkt) != resp_len) {
+        sc->sc_diag_nvm_err = EIO;
+        iwx_publish_diag(sc);
         err = EIO;
         goto out;
     }
@@ -5242,10 +5743,19 @@ iwx_nvm_get(struct iwx_softc *sc)
     
     iwx_set_mac_addr_from_csr(sc, nvm);
     if (!iwx_is_valid_mac_addr(nvm->hw_addr)) {
-        XYLog("%s: no valid mac address was found\n", DEVNAME(sc));
+        XYLog("%s: no valid mac address was found (base 0x%x, got "
+              "%02x:%02x:%02x:%02x:%02x:%02x)\n", DEVNAME(sc),
+              sc->sc_mac_addr_from_csr,
+              nvm->hw_addr[0], nvm->hw_addr[1], nvm->hw_addr[2],
+              nvm->hw_addr[3], nvm->hw_addr[4], nvm->hw_addr[5]);
+        sc->sc_diag_nvm_err = EINVAL;
+        iwx_publish_diag(sc);
         err = EINVAL;
         goto out;
     }
+
+    sc->sc_diag_nvm_err = 0;
+    iwx_publish_diag(sc);
     
     rsp = (struct iwx_nvm_get_info_rsp *)hcmd.resp_pkt->data;
     
@@ -5284,6 +5794,38 @@ iwx_nvm_get(struct iwx_softc *sc)
         rsp_v3 = (struct iwx_nvm_get_info_rsp_v3 *)rsp;
         iwx_init_channel_map(sc, rsp_v3->regulatory.channel_profile,
                              NULL, IWX_NUM_CHANNELS_V1);
+    }
+    /*
+     * Recompute ic_chan_active now that ic_channels[] finally has data.
+     *
+     * ieee80211_ifattach() calls ieee80211_setmode(ic, ic_curmode) long before
+     * this point. At that moment ic_channels[] is still empty, so setmode()
+     * takes its "no channels found for mode %u" early return - which sits
+     * BEFORE the memset/setbit loop - and ic_chan_active stays all zero.
+     * Nothing ever recomputes it afterwards.
+     *
+     * Consequence observed on hardware (macOS 26, SC):
+     *   - IO80211's APPLE80211_IOC_CHANNELS_INFO -> copyWCLChannels() iterates
+     *     ic_chan_active, finds zero channels, returns kIOReturnNotReady.
+     *   - The scan manager therefore stays in SCAN_MANAGER_STATE_HALTED, and
+     *     every APPLE80211_IOC_SCAN_REQ is refused with kIOReturnError.
+     *   - ifconfig shows en0 up but no network is ever found.
+     *
+     * This reproduces exactly the MODE_AUTO branch of
+     * ieee80211_setmode(), but without its ieee80211_reset_scan() and
+     * "Bad IBSS channel" side effects, which are unsafe this early (the
+     * ifnet is not running yet and iwx_newstate_task is not scheduled).
+     */
+    {
+        struct ieee80211com *ic = &sc->sc_ic;
+        int i;
+
+        memset(ic->ic_chan_active, 0, sizeof(ic->ic_chan_active));
+        for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
+            if (ic->ic_channels[i].ic_flags != 0)
+                setbit(ic->ic_chan_active, i);
+        }
+        iwx_publish_diag(sc);
     }
 out:
     iwx_free_resp(sc, &hcmd);
@@ -5341,22 +5883,88 @@ iwx_load_firmware(struct iwx_softc *sc)
      * failure path these values are the only evidence we can get, because an
      * OpenCore-injected kext cannot reach logd from the installer.
      *
-     *   CSR_FUNC_SCRATCH     must have been written with 0x01010101 by the
-     *                        host right before ROM_START; if it still reads
-     *                        that value the kick was issued.
-     *   CSR_GP_CNTRL         ROM_START (bit 7) is self-clearing once the ROM
-     *                        consumed the image; MAC_STATUS (bit 20) shows the
-     *                        MAC is out of reset.
+     *   CSR_FUNC_SCRATCH     the host wrote 0x01010101 right before
+     *                        ROM_START. Neither Linux nor OpenBSD ever reads
+     *                        this back on the ALIVE path, so the value says
+     *                        nothing about whether the firmware ran: it is
+     *                        recorded only because a change away from
+     *                        0x01010101 proves the firmware did touch it.
+     *   CSR_GP_CNTRL         MAC_STATUS (bit 20) shows the MAC is out of
+     *                        reset. ROM_START (bit 7) is NOT self-clearing in
+     *                        any documented sense - the driver sets it and
+     *                        never polls it, so a host read of it carries no
+     *                        information either way.
      *   CSR_INT              ALIVE is bit 0; a set bit here with uc_intr == 0
      *                        would mean the notification arrived but the
      *                        handler never ran.
      *   CSR_CTXT_INFO_BOOT_CTRL  AUTO_FUNC_BOOT_ENA (bit 1) must be set.
+     *                        Note this macro shares offset 0x0 with
+     *                        CSR_HW_IF_CONFIG_REG, so the value proves the
+     *                        host write landed, not that the firmware acted
+     *                        on it.
      */
     sc->sc_diag_func_scratch = IWX_READ(sc, IWX_CSR_FUNC_SCRATCH);
     sc->sc_diag_gp_cntrl     = IWX_READ(sc, IWX_CSR_GP_CNTRL);
     sc->sc_diag_int_status   = IWX_READ(sc, IWX_CSR_INT);
     sc->sc_diag_ctxt_boot_ctrl = IWX_READ(sc, IWX_CSR_CTXT_INFO_BOOT_CTRL);
     sc->sc_diag_alive_wait_loops = err;   /* 0 = ALIVE, EWOULDBLOCK = timeout */
+
+    /*
+     * Second group: evidence that separates "the firmware never ran" from
+     * "the firmware ran but the notification was lost". All of it still runs
+     * before iwx_ctxt_info_free_fw_img()/iwx_dma_contig_free() below, so the
+     * DMA buffers are still valid and the registers still belong to us.
+     *
+     *   prph_info  the firmware mirrors its Boot Stage CSR, IPC status and
+     *              sleep state into this host-DRAM page (iwx_prph_info,
+     *              if_iwxreg.h:421-426; allocated at :1283 and announced in
+     *              ctxt_info at :1292). A non-zero boot_stage_mirror is the
+     *              only positive proof that the peripheral executed code.
+     *   rxq        ALIVE is delivered as an FH RX packet, so the ring's
+     *              hardware index is the cheapest "did anything get written".
+     *   FH_INT_STATUS / HW_IF_CONFIG
+     *              whether the FH layer raised anything at all. NB:
+     *              HW_IF_CONFIG_REG is offset 0x0, the same register that
+     *              CTXT_INFO_BOOT_CTRL writes (see if_iwxreg.h:78 vs :578), so
+     *              it can only confirm our own write landed.
+     */
+    if (sc->prph_info_dma.vaddr != NULL) {
+        struct iwx_prph_info *prph_info =
+            (struct iwx_prph_info *)sc->prph_info_dma.vaddr;
+        sc->sc_diag_prph_boot_stage = le32toh(prph_info->boot_stage_mirror);
+        sc->sc_diag_prph_ipc = le32toh(prph_info->ipc_status_mirror);
+        sc->sc_diag_prph_sleep = le32toh(prph_info->sleep_notif);
+    }
+    if (sc->rxq.stat != NULL) {
+        if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
+            sc->sc_diag_rxq_hw =
+                le16toh(*(uint16_t *)(sc->rxq.stat)) & 0xfff;
+        else
+            sc->sc_diag_rxq_hw =
+                le16toh(((struct iwx_rb_status *)sc->rxq.stat)->closed_rb_num) & 0xfff;
+    }
+    sc->sc_diag_rxq_cur = sc->rxq.cur;
+    sc->sc_diag_fh_int_status = IWX_READ(sc, IWX_CSR_FH_INT_STATUS);
+    sc->sc_diag_hw_if_config = IWX_READ(sc, IWX_CSR_HW_IF_CONFIG_REG);
+    /*
+     * iwx_ict_reset() (called from iwx_post_alive) writes this register with
+     * bit 31 = ENABLE. Linux never does that under MSI-X because it only
+     * allocates the ICT table in the non-msix branch, so reset_ict() bails
+     * out. Read it back here: bit 31 still set on an MSI-X device means the
+     * firmware may be depositing causes into the DRAM table, which would
+     * explain CSR_MSIX_FH_INT_CAUSES_AD reading 0 forever.
+     */
+    sc->sc_diag_dram_int_tbl = IWX_READ(sc, IWX_CSR_DRAM_INT_TBL_REG);
+    /*
+     * Authoritative CSR_INT_MASK reading. intrFilter() and
+     * iwx_restore_interrupts() also sample this field, but only from contexts
+     * that may not be the last one before the publish; taking it again here
+     * means the value read from the IORegistry after a failed ALIVE is exactly
+     * what the register held at that moment. Combined with sc_diag_intr_count:
+     *   0 interrupts + non-zero mask -> armed, but the device never fired
+     *   >0 interrupts + zero mask    -> the last ISR left it deaf
+     */
+    sc->sc_diag_int_mask = IWX_READ(sc, IWX_CSR_INT_MASK);
     iwx_publish_diag(sc);
 
     if (err == ENXIO)
@@ -5368,16 +5976,27 @@ iwx_load_firmware(struct iwx_softc *sc)
         sc->sc_dmat->deferRecycling();
 #endif
         if (iwx_nic_lock(sc)) {
-            XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
-                  iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_1_STATUS),
-                  iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_2_STATUS));
-            XYLog("UMAC PC: 0x%x\n",
-                  iwx_read_umac_prph(sc,
-                                     IWX_UREG_UMAC_CURRENT_PC));
-            XYLog("LMAC PC: 0x%x\n",
-                  iwx_read_umac_prph(sc,
-                                     IWX_UREG_LMAC1_CURRENT_PC));
+            sc->sc_diag_secboot_cpu1 =
+                iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_1_STATUS);
+            sc->sc_diag_secboot_cpu2 =
+                iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_2_STATUS);
+            /*
+             * UMAC/LMAC PC are NOT read on SC. Linux only reads these two
+             * PRPH registers for device_family in the 9000..AX210 range
+             * (mvm/fw.c:375-386); from 22000 up, including SC, it walks the
+             * firmware-provided pc_data table (IWL_UCODE_TLV_CURRENT_PC,
+             * TLV 68) instead, which lives in host DRAM. Reading 0xa05c18 /
+             * 0xa05c1c here would return a value with no defined meaning, so
+             * the fields are left at their "not sampled" default.
+             */
             iwx_nic_unlock(sc);
+            /* Publish after releasing the MAC access request: setProperty
+             * allocates, and holding nic_lock across it buys nothing. */
+            iwx_publish_diag(sc);
+            XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
+                  sc->sc_diag_secboot_cpu1, sc->sc_diag_secboot_cpu2);
+            XYLog("UMAC PC: 0x%x\n", sc->sc_diag_umac_pc);
+            XYLog("LMAC PC: 0x%x\n", sc->sc_diag_lmac_pc);
         }
         iwx_ctxt_info_free_paging(sc);
         XYLog("%s: could not load firmware\n", DEVNAME(sc));
@@ -5533,7 +6152,23 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
     if (err) {
         XYLog("%s: failed to load init firmware\n", DEVNAME(sc));
         sc->sc_diag_alive = 0;
-        iwx_diag_fail(sc, "load-init-fw", "load-ucode-wait-alive-failed");
+        /*
+         * Do NOT clobber the inner diagnosis.
+         *
+         * iwx_load_ucode_wait_alive() already called iwx_diag_fail() with
+         * "fw-read" / "fw-start" / "pnvm" before returning. iwx_diag_fail()
+         * assigns BOTH fields unconditionally (:20933-20939), so overwriting
+         * here made three completely different failures read identically from
+         * IORegistry as stage="load-init-fw" /
+         * error="load-ucode-wait-alive-failed". That is exactly why a full
+         * round of real-machine readings could not tell "PNVM failed" from
+         * "ALIVE failed", and why xd3 had to be invented.
+         */
+        if (sc->sc_diag_error == NULL || strcmp(sc->sc_diag_error, "none") == 0)
+            iwx_diag_fail(sc, "load-init-fw",
+                          "load-ucode-wait-alive-failed");
+        else
+            iwx_publish_diag(sc);
         return err;
     }
     
@@ -5546,25 +6181,120 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
      */
     err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_SYSTEM_GROUP,
                                            IWX_INIT_EXTENDED_CFG_CMD), IWX_CMD_SEND_IN_RFKILL, sizeof(init_cfg), &init_cfg);
-    if (err)
+    sc->sc_diag_init_cmd_err = err;
+    if (err) {
+        /*
+         * The command went out (err != 0x7fffffff) but its ack never came.
+         * Take the two measurements that separate "firmware never answered"
+         * from "firmware answered and the vector never arrived":
+         *   - the MSI-X cause registers, which the handler really reads
+         *     (CSR_FH_INT_STATUS is the legacy register and is useless here)
+         *   - the RX hardware index, re-read now rather than before the send
+         */
+        sc->sc_diag_msix_fh_causes = IWX_READ(sc, IWX_CSR_MSIX_FH_INT_CAUSES_AD);
+        sc->sc_diag_msix_hw_causes = IWX_READ(sc, IWX_CSR_MSIX_HW_INT_CAUSES_AD);
+        sc->sc_diag_msix_automask = IWX_READ(sc, IWX_CSR_MSIX_AUTOMASK_ST_AD);
+        if (sc->rxq.stat != NULL) {
+            if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
+                sc->sc_diag_rxq_hw_after = le16toh(*(uint16_t *)(sc->rxq.stat)) & 0xfff;
+            else
+                sc->sc_diag_rxq_hw_after =
+                    le16toh(((struct iwx_rb_status *)sc->rxq.stat)->closed_rb_num) & 0xfff;
+        }
+        sc->sc_diag_rxq_cur_after = sc->rxq.cur;
+        /*
+         * Read the ICT DRAM table itself. iwx_ict_reset() zeroed it before
+         * enabling the hardware pointer, so a non-zero word here can only
+         * come from the firmware. Combined with sc_diag_dram_int_tbl's
+         * bit 31 (ENABLE) this decides the ICT hypothesis inside a single
+         * boot: enabled + non-zero table => causes went to DRAM and the
+         * MSI-X handler was structurally blind; enabled + all-zero table
+         * => ICT is not the reason and the command never reached the
+         * firmware.
+         */
+        if (sc->ict_dma.vaddr != NULL) {
+            uint32_t *ict = (uint32_t *)sc->ict_dma.vaddr;
+            uint32_t sum = 0;
+            int i, nwords = IWX_ICT_SIZE / (int)sizeof(uint32_t);
+            for (i = 0; i < nwords; i++)
+                sum |= le32toh(ict[i]);
+            sc->sc_diag_ict_sum = sum;
+            sc->sc_diag_ict_tbl_words = nwords;
+        }
+        sc->sc_diag_ict_cur_snapshot = sc->ict_cur;
+        iwx_publish_diag(sc);
         return err;
+    }
 
     err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP,
                                            IWX_NVM_ACCESS_COMPLETE), IWX_CMD_SEND_IN_RFKILL, sizeof(nvm_complete), &nvm_complete);
-    if (err)
+    sc->sc_diag_nvm_cmd_err = err;
+    if (err) {
+        iwx_publish_diag(sc);
         return err;
+    }
+
+    /*
+     * PHY_CONFIGURATION is NOT sent here.
+     *
+     * A previous revision of this patch called iwx_send_phy_cfg_cmd() at this
+     * point, based on Linux iwl_run_unified_mvm_ucode() (mvm/fw.c:686). That
+     * was wrong: the call site exists but the function itself bails out first
+     * for every unified-ucode device without TX antenna diversity
+     * (mvm/fw.c:561-563):
+     *
+     *     if (iwl_mvm_has_unified_ucode(mvm) &&
+     *         !mvm->trans->cfg->tx_with_siso_diversity)
+     *             return 0;
+     *
+     * SC is a unified-ucode family and iwl_sc_base never sets
+     * tx_with_siso_diversity (cfg/sc.c), so Linux sends nothing at all.
+     * OpenBSD agrees: iwx_send_phy_cfg_cmd() is only reached from
+     * iwx_init_hw() behind `if (sc->sc_tx_with_siso_diversity)`
+     * (ob-if_iwx.c:10112-10120). itlwm already has that same gated call in
+     * iwx_init_hw(), so an unconditional send here was both duplicate and
+     * unsolicited - the firmware never acknowledged it (EWOULDBLOCK after
+     * the 1 s command budget) and the whole init sequence aborted before
+     * ever waiting for INIT_COMPLETE.
+     */
 
     /*
      * INIT_COMPLETE can arrive before NVM_ACCESS_COMPLETE is acknowledged, and
      * it has a 2 s budget. A timeout here with everything above at "ok" means
      * the firmware started but never finished the INIT image.
+     *
+     * No loss window exists for an early notification: iwx_rx_pkt() does
+     * `sc_init_complete |= IWX_INIT_COMPLETE` (sticky, never cleared after
+     * iwx_run_init_mvm_ucode() zeroes it before load_ucode_wait_alive) and
+     * iwx_wait_notification() tests the bits before it ever sleeps, so a
+     * notification that arrived during the preceding commands returns here
+     * immediately. That makes this wait the one honest discriminator between
+     * "firmware never sent INIT_COMPLETE" and everything upstream of it.
      */
     sc->sc_diag_init = "waiting";
+    sc->sc_diag_init_bits_before = sc->sc_init_complete;
     iwx_publish_diag(sc);
     err = iwx_wait_notification(sc, &sc->sc_init_complete, wait_flags, 2000);
+    sc->sc_diag_init_wait_err = err;
     if (err) {
+        /*
+         * Record what the firmware was actually told about the PNVM. If
+         * pnvm_size is still 0 here the payload never made it into
+         * prph_scratch, and that is the one input the firmware needs for the
+         * regulatory/channel tables it has to install before it can finish
+         * the INIT image. Reading it costs one DMA-memory dereference and
+         * needs no hardware access.
+         */
+        if (sc->prph_scratch_dma.vaddr != NULL) {
+            struct iwx_prph_scratch_ctrl_cfg *cfg =
+                &((struct iwx_prph_scratch *)sc->prph_scratch_dma.vaddr)->ctrl_cfg;
+            sc->sc_diag_pnvm_size = le32toh(cfg->pnvm_cfg.pnvm_size);
+            sc->sc_diag_pnvm_addr_ok =
+                (le64toh(cfg->pnvm_cfg.pnvm_base_addr) != 0);
+        }
         sc->sc_diag_init = "timeout";
         iwx_diag_fail(sc, "init-complete", "init-complete-timeout");
+        iwx_publish_diag(sc);
         return err;
     }
     sc->sc_diag_init = "ok";
@@ -9528,6 +10258,22 @@ iwx_rx_frame(struct iwx_softc *sc, mbuf_t m, int chanidx,
                      m, BPF_DIRECTION_IN);
     }
 #endif
+    /*
+     * xe3: split the frames that actually reached net80211 by type. The three
+     * counters plus ic_diag_beacon_evt (bumped inside ieee80211_add_scan's
+     * caller) localise the "43 scans, 4 BSS" failure to one layer.
+     */
+    if (mbuf_len(m) >= sizeof(struct ieee80211_frame)) {
+        const uint8_t fc0 = mtod(m, const uint8_t *)[0];
+        if ((fc0 & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT) {
+            const uint8_t subtype = fc0 & IEEE80211_FC0_SUBTYPE_MASK;
+            ++sc->sc_diag_rx_mgmt;
+            if (subtype == IEEE80211_FC0_SUBTYPE_BEACON)
+                ++sc->sc_diag_rx_beacon;
+            else if (subtype == IEEE80211_FC0_SUBTYPE_PROBE_RESP)
+                ++sc->sc_diag_rx_proberesp;
+        }
+    }
     ieee80211_inputm(IC2IFP(ic), m, ni, rxi, ml);
     ieee80211_release_node(ic, ni);
 }
@@ -9971,6 +10717,50 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
         IC2IFP(ic)->netStat->inputErrors++;
         mbuf_freem(m);
         return;
+    }
+
+    /*
+     * xe3 v331 (behaviour change, the only one): strip the trailing MIC+CRC
+     * bytes the hardware left in the buffer, exactly as Linux does.
+     *
+     * mac_flags1[7:4] counts them in 2-byte words (iwl-fw-api-rx.h: "shift
+     * should be 4, but the length is measured in 2-byte words, so shifting
+     * only by 3 gives a byte result").  A management frame carries no MIC, so
+     * the field is 2 and mic_crc_len is the 4-byte FCS.
+     *
+     * Linux iwl_mvm_create_skb() (mvm/rxmq.c) removes them for every
+     * non-monitor interface:
+     *   if (len > mic_crc_len && !ieee80211_hw_check(mvm->hw, RX_INCLUDES_FCS))
+     *           len -= mic_crc_len;
+     * RX_INCLUDES_FCS is only set in monitor context, so the guard means
+     * "always strip when we are not a monitor".  It is *not* "the firmware
+     * appends an FCS in monitor mode only" - the bytes are already in the
+     * buffer and the driver is the one that removes them.
+     *
+     * iwx(4) and this port never did that: OpenBSD's net80211 merely breaks out
+     * of the IE loop on trailing junk and still builds the node.  net80211 here
+     * keeps the extra bytes in mbuf_len() as well, but WCL's validIEs() insists
+     * the element stream ends exactly, so almost every beacon was discarded:
+     * is_rx_elem_toosmall counted 2176 of 2195 management frames and only 7 of
+     * 2138 otherwise-valid beacons reached the scan cache.  Both numbers match
+     * the arithmetic for a 4-byte random tail (253/256 and 1/256+1/65536).
+     *
+     * Restricted to unencrypted frames: with encryption this field also counts
+     * the MIC, and RADA normally removes it.  Linux additionally compensates
+     * with crypt_len when RADA is off, which would need the FH header we do not
+     * carry here.  Scan frames are never encrypted, so this is the whole scope
+     * needed and no working data path is touched.
+     */
+    unsigned int mic_crc_len =
+        ((unsigned int)desc->mac_flags1 & IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_MASK) >>
+        IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_SHIFT;
+    if (mic_crc_len && ic->ic_opmode != IEEE80211_M_MONITOR &&
+        (le16toh(desc->status) & IWX_RX_MPDU_RES_STATUS_SEC_ENC_MSK) ==
+            IWX_RX_MPDU_RES_STATUS_SEC_NO_ENC &&
+        len > mic_crc_len + sizeof(struct ieee80211_frame)) {
+        len -= mic_crc_len;
+        sc->sc_diag_fcs_trimmed++;
+        sc->sc_diag_fcs_last = (int)mic_crc_len;
     }
     
     //    m->m_data = pktdata + sizeof(*desc);
@@ -10807,6 +11597,13 @@ iwx_binding_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action)
     int i, err, active = (sc->sc_flags & IWX_FLAG_BINDING_ACTIVE);
     uint32_t status;
     
+    /*
+     * No binding context on MLD firmware: LINK_CONFIG_CMD carries the
+     * MAC-to-PHY binding instead, and it is sent from iwx_mld_add_sta_cmd().
+     */
+    if (sc->sc_use_mld_api)
+        return 0;
+    
     if (action == IWX_FW_CTXT_ACTION_ADD && active) {
         XYLog("binding already added\n");
         return 0;
@@ -11034,6 +11831,7 @@ iwx_phy_ctxt_cmd(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
     awdlPhyBuildingId = ctxt ? int(ctxt->id) : -1;
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_phy_context_cmd_v1 cmd;
+    uint8_t cmdver;
     uint8_t active_cnt, idle_cnt;
     struct ieee80211_channel *chan = ctxt->channel;
     
@@ -11067,7 +11865,24 @@ iwx_phy_ctxt_cmd(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
     // Any other context set up from here is 20 MHz.
     if (!awdlWide80Trying && action != IWX_FW_CTXT_ACTION_REMOVE)
         awdlWide80Live = false;
-    if (iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD) == 3)
+    /*
+     * PHY_CONTEXT_CMD: trust the firmware's command-version table (TLV 48).
+     *
+     * This is NOT a "SC firmware ships no CMD_VERSIONS TLV" case: the image
+     * declares 229 entries, and PHY_CONTEXT_CMD (LONG group, cmd 0x8) is
+     * version 4. The original "== 3" test therefore missed it and fell through
+     * to iwx_phy_ctxt_cmd_uhb() (capa bit 48, ULTRA_HB_CHANNELS, is set for this
+     * image), whose layout the firmware rejects. That surfaced as a 1 s
+     * EWOULDBLOCK on command 0x108 and aborted iwx_init_hw() before any phy
+     * context existed (xd10 "id=0x108 e=35", xd11 bs=0).
+     *
+     * v3 and v4 share the same struct, which is why Linux accepts both:
+     * "if (ver >= 3 && ver <= 4)". Do the same, and publish the version so one
+     * boot proves which branch was taken (xd14 phyv=).
+     */
+    cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD);
+    sc->sc_diag_phy_ctxt_ver = cmdver;
+    if (cmdver == 3 || cmdver == 4)
         return iwx_phy_ctxt_cmd_v3(sc, ctxt, chains_static,
                                    chains_dynamic, action, apply_time);
     
@@ -11187,6 +12002,16 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
      * group 0 with a "BAD_COMMAND" firmware error. We must pretend
      * that such commands were in the LONG_GROUP instead in order
      * for firmware to accept them.
+     *
+     * Do NOT try to "help" the firmware by re-homing such a command into
+     * another group just because the CMD_VERSIONS table happens to list
+     * the same opcode there: the (group, opcode) pair is the command
+     * identity.  sc-a0, for example, lists opcode 0x1d in group 0x0e
+     * (v5) -- an entirely different command -- while our SCD_QUEUE_CFG is
+     * the group-1 (v0) one.  Sending it as (0x0e, 0x1d) makes the
+     * firmware drop it, which cost a 1 s timeout on the very first MGMT
+     * Tx queue we tried to enable and stalled the whole join.  OpenBSD
+     * (ob-if_iwx.c:5871-5881) only ever rewrites group 0 to LONG_GROUP.
      */
     if (iwx_cmd_groupid(code) == 0) {
         code = IWX_WIDE_ID(IWX_LONG_GROUP, code);
@@ -11319,6 +12144,26 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
     }
 out:
     if (err) {
+        /*
+         * Remember the first command that failed. iwx_init_hw() issues a long
+         * sequence of commands and any single timeout makes iwx_init() fail
+         * with 35, which is indistinguishable from the S_SCAN wait timing out.
+         * Keep the first record so a later retry cannot overwrite the cause.
+         */
+        if (sc->sc_diag_cmd_err == 0x7fffffff) {
+            sc->sc_diag_cmd_id = code;
+            sc->sc_diag_cmd_err = err;
+        }
+        /*
+         * iwx_init_hw() no longer aborts on the first failure (see the
+         * IWX_INIT_CONT block there), so keep up to four distinct ids. That
+         * way one boot names every command that is still mismatched instead
+         * of one per reboot. Published as xd13.
+         */
+        if (sc->sc_diag_cmd_fail_n < 4 &&
+            (sc->sc_diag_cmd_fail_n == 0 ||
+             sc->sc_diag_cmd_fail[sc->sc_diag_cmd_fail_n - 1] != code))
+            sc->sc_diag_cmd_fail[sc->sc_diag_cmd_fail_n++] = code;
         ::free(sc->sc_cmd_resp_pkt[idx]);
         sc->sc_cmd_resp_pkt[idx] = NULL;
         sc->sc_cmd_resp_len[idx] = 0;
@@ -12557,6 +13402,13 @@ iwx_drain_sta(struct iwx_softc *sc, struct iwx_node* in, int drain)
     int err;
     uint32_t status;
     
+    /*
+     * No drain command on MLD firmware. There is no ADD_STA there either, so
+     * the flow-control drain it would toggle does not exist.
+     */
+    if (sc->sc_use_mld_api)
+        return 0;
+    
     memset(&cmd, 0, sizeof(cmd));
     cmd.mac_id_n_color = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id,
                                                          in->in_color));
@@ -12727,6 +13579,14 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
     uint32_t max_aggsize = (IWX_STA_FLG_MAX_AGG_SIZE_4M >> IWX_STA_FLG_MAX_AGG_SIZE_SHIFT);
     struct ieee80211com *ic = &sc->sc_ic;
     
+    /*
+     * MLD firmware replaces ADD_STA with STA_CONFIG_CMD in MAC_CONF_GROUP,
+     * preceded by an explicit LINK_CONFIG_CMD (there is no binding context to
+     * hang the link off). Everything below is the legacy command.
+     */
+    if (sc->sc_use_mld_api)
+        return iwx_mld_add_sta_cmd(sc, in, update);
+    
     if (!update && (sc->sc_flags & IWX_FLAG_STA_ACTIVE)) {
         XYLog("STA already added\n");
         return 0;
@@ -12855,6 +13715,31 @@ iwx_add_aux_sta(struct iwx_softc *sc)
      * station and not lmac id
      */
     cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
+    /*
+     * SC firmware DOES ship the command-version table (TLV 48, 229 entries) --
+     * but it does not declare ADD_STA in the LONG group, so the lookup below
+     * still returns IWX_FW_CMD_VER_UNKNOWN.
+     *
+     * The gate only skips this command when the firmware *declares* ADD_STA
+     * version >= 12. AX210-class firmware declares 12, so itlwm has always
+     * skipped the aux station there. On SC the lookup is UNKNOWN, we fell
+     * through and sent the legacy ADD_STA v10 layout -- and SC firmware never
+     * acknowledges it: xd10 read "id=0x118 e=35" (IWX_WIDE_ID(LONG, ADD_STA) =
+     * 0x118, EWOULDBLOCK), which aborted iwx_init_hw() before
+     * ieee80211_begin_scan() was ever reached (xd11 bs=0).
+     *
+     * Modern firmware (Bz/SC) owns the auxiliary station internally; OpenBSD
+     * iwx never sends an aux ADD_STA on any device, and itlwm never sends one
+     * on AX210 either. Skipping it on SC restores that parity. If the firmware
+     * really needs the station it will complain at the next command, which xd10
+     * / xd13 now name directly -- the new-station-api encoding
+     * (mac_id_n_color = raw lmac_id, tfd_queue_mask = 0) is the fallback then,
+     * not the first move.
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        sc->sc_diag_aux_sta_skipped = 1;
+        return 0;
+    }
     if (cmdver != IWX_FW_CMD_VER_UNKNOWN && cmdver >= 12)
         return 0;
     
@@ -12882,6 +13767,10 @@ iwx_rm_sta_cmd(struct iwx_softc *sc, struct iwx_node *in)
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_rm_sta_cmd rm_sta_cmd;
     int err;
+    
+    /* MLD firmware removes the station with STA_REMOVE_CMD (group 0x03). */
+    if (sc->sc_use_mld_api)
+        return iwx_mld_rm_sta_cmd(sc, in);
     
     if ((sc->sc_flags & IWX_FLAG_STA_ACTIVE) == 0) {
         XYLog("sta already removed\n");
@@ -13156,36 +14045,11 @@ iwx_config_umac_scan(struct iwx_softc *sc)
     scan_config->tx_chains = htole32(iwx_fw_valid_tx_ant(sc));
     scan_config->rx_chains = htole32(iwx_fw_valid_rx_ant(sc));
     
-    /*
-     * xe3-macos [SC]: do not advertise a station id that does not exist.
-     *
-     * bcast_sta_id is the station the firmware reports scan/ROC traffic on.
-     * It is deprecated from SCAN_CFG_CMD version 5 on -- Linux leaves it at 0
-     * for that case (mvm/scan.c:1263-1271, comment "Fw doesn't use this sta
-     * anymore. Deprecated on SCAN_CFG_CMD version 5") and OpenBSD does the
-     * same (ob-if_iwx.c:7496-7498).  SC firmware declares SCAN_CFG_CMD v5
-     * (TLV 48: group 1 / cmd 0x0c -> 5) and, like Bz, owns the auxiliary
-     * station internally -- which is exactly why iwx_add_aux_sta() is
-     * skipped for this family -- so IWX_AUX_STA_ID (=1) names a station that
-     * was never created here.
-     *
-     * The lookup below also asks the wrong command: ADD_STA is absent from
-     * SC's version table, so it returns IWX_FW_CMD_VER_UNKNOWN (=99) and the
-     * first branch fires.  Linux treats an undeclared ADD_STA as "new
-     * station API" (IWL_FW_CMD_VER_UNKNOWN == 99, so 99 >= 12) and writes 0.
-     *
-     * Only pre-SC families keep the historical aux-station id, so AX210 and
-     * older behave bit-for-bit as before.
-     */
-    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
-        scan_config->bcast_sta_id = 0;
-    } else {
-        cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
-        if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 12)
-            scan_config->bcast_sta_id = IWX_AUX_STA_ID;
-        else if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 5)
-            scan_config->bcast_sta_id = 0xFF;
-    }
+    cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
+    if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 12)
+        scan_config->bcast_sta_id = IWX_AUX_STA_ID;
+    else if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 5)
+        scan_config->bcast_sta_id = 0xFF;
     
     hcmd.data[0] = scan_config;
     hcmd.len[0] = cmd_size;
@@ -13287,6 +14151,8 @@ iwx_umac_scan_size(struct iwx_softc *sc)
         return sizeof(iwx_scan_req_umac_v12);
     else if (scan_ver == 14)
         return sizeof(iwx_scan_req_umac_v14);
+    else if (scan_ver == 17)
+        return sizeof(struct iwx_scan_req_umac_v17);
     
     if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_ADAPTIVE_DWELL_V2))
         base_size = IWX_SCAN_REQ_UMAC_SIZE_V8;
@@ -13360,6 +14226,181 @@ iwx_get_scan_req_umac_data(struct iwx_softc *sc, struct iwx_scan_req_umac *req)
 /* minimal number of 2GHz and 5GHz channels in the regular scan request */
 #define IWX_MVM_6GHZ_PASSIVE_SCAN_MIN_CHANS 4
 
+/*
+ * SCAN_REQ_UMAC v17 support.
+ *
+ * The SC (Bz/Scarborough) image declares SCAN_REQ_UMAC = version 17 in firmware
+ * TLV 48. Everything below v14 was already handled, and the v14 builder is
+ * byte-identical to Linux's for v14; what changes in v17 is two sub-structures:
+ * the general params became v11 (rename only, same 36 bytes) and the channel
+ * config became v5 (band moved from its own byte into bits 30/31 of flags).
+ * Sending the v14 layout to a v17-declaring firmware makes it ignore the
+ * command, which is what "xd9 se=0x7fffffff with ic_state still INIT" looked
+ * like on v327.
+ *
+ * Ported from OpenBSD sys/dev/pci/if_iwx.c (iwx_umac_scan_flags_v2,
+ * iwx_umac_scan_fill_channels_v5, iwx_scan_umac_dwell_v11,
+ * iwx_scan_umac_fill_general_p_v11, iwx_scan_umac_fill_ch_p_v7,
+ * iwx_umac_scan_v17), cross-checked field by field against Linux
+ * mvm/scan.c (iwl_mvm_scan_umac_v14_and_above, version 17).
+ */
+
+uint16_t ItlIwx::
+iwx_scan_umac_flags_v2(struct iwx_softc *sc, int bgscan, bool active)
+{
+    uint16_t flags = 0;
+    
+    if (!active)
+        flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE;
+    
+    flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL;
+    flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_NTFY_ITER_COMPLETE;
+    flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
+    
+    return flags;
+}
+
+/*
+ * SCAN_CHANNEL_CONFIG_API_S_VER_5 variant of iwx_umac_scan_fill_channels().
+ *
+ * Differences from the v1/v2 helper, both required by the v17 layout:
+ *   - the band is OR-ed into bits 30/31 of @flags instead of being stored in
+ *     its own byte, and that byte is @psd_20 in v5;
+ *   - @channel_cfg_flags (the directed-scan SSID bitmap built by the caller)
+ *     is the base value of @flags rather than a per-entry afterthought.
+ *
+ * The itlwm-only WCL channel selection filter is kept: it decides *which*
+ * channels enter the list, not how an entry is encoded, so it cannot change
+ * the command layout.
+ */
+uint8_t ItlIwx::
+iwx_umac_scan_fill_channels_v5(struct iwx_softc *sc,
+                               struct iwx_scan_channel_cfg_umac_v5 *chan,
+                               size_t chan_nitems, bool active,
+                               uint32_t channel_cfg_flags)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_channel *c;
+    uint8_t nchan;
+    
+    for (nchan = 0, c = &ic->ic_channels[1];
+         c <= &ic->ic_channels[IEEE80211_CHAN_MAX] &&
+         nchan < chan_nitems &&
+         nchan < sc->sc_capa_n_scan_channels;
+         c++) {
+        uint8_t channel_num, band;
+        uint32_t flags;
+        
+        if (c->ic_flags == 0)
+            continue;
+#ifdef AIRPORT_WCL
+        if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+                ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+                ieee80211_chan2ieee(ic, c)))
+            continue;
+#endif
+        
+        channel_num = ieee80211_mhz2ieee(c->ic_freq, 0);
+        if (IEEE80211_IS_CHAN_2GHZ(c))
+            band = IWX_PHY_BAND_24;
+        else
+            band = IWX_PHY_BAND_5;
+        
+        flags = channel_cfg_flags;
+#ifdef AIRPORT_WCL
+        if (AirportWCL::probeChannel(active,
+                c->ic_flags & IEEE80211_CHAN_PASSIVE, c->ic_flags & IEEE80211_CHAN_DFS))
+#else
+        if (active)
+#endif
+            flags |= (1 << 0); /* select SSID 0 */
+        
+        chan->channel_num = channel_num;
+        chan->psd_20 = -128;
+        chan->iter_count = 1;
+        chan->iter_interval = 0;
+        chan->flags = htole32(flags |
+                              ((uint32_t)band << IWX_CHAN_CFG_FLAGS_BAND_POS));
+        chan++;
+        nchan++;
+    }
+    
+    return nchan;
+}
+
+void ItlIwx::
+iwx_scan_umac_dwell_v11(struct iwx_softc *sc,
+                        struct iwx_scan_general_params_v11 *general_params,
+                        int bgscan)
+{
+    uint32_t suspend_time, max_out_time;
+    uint8_t active_dwell, passive_dwell;
+    
+    active_dwell = IWL_SCAN_DWELL_ACTIVE;
+    passive_dwell = IWL_SCAN_DWELL_PASSIVE;
+    
+    general_params->adwell_default_social_chn =
+        IWX_SCAN_ADWELL_DEFAULT_N_APS_SOCIAL;
+    general_params->adwell_default_2g = IWX_SCAN_ADWELL_DEFAULT_LB_N_APS;
+    general_params->adwell_default_5g = IWX_SCAN_ADWELL_DEFAULT_HB_N_APS;
+    
+    if (bgscan)
+        general_params->adwell_max_budget =
+            htole16(IWX_SCAN_ADWELL_MAX_BUDGET_DIRECTED_SCAN);
+    else
+        general_params->adwell_max_budget =
+            htole16(IWX_SCAN_ADWELL_MAX_BUDGET_FULL_SCAN);
+    
+    general_params->scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
+    if (bgscan) {
+        max_out_time = htole32(120);
+        suspend_time = htole32(120);
+    } else {
+        max_out_time = htole32(0);
+        suspend_time = htole32(0);
+    }
+    general_params->max_out_of_time[IWX_SCAN_LB_LMAC_IDX] = max_out_time;
+    general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] = suspend_time;
+    general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] = max_out_time;
+    general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] = suspend_time;
+    
+    general_params->active_dwell[IWX_SCAN_LB_LMAC_IDX] = active_dwell;
+    general_params->passive_dwell[IWX_SCAN_LB_LMAC_IDX] = passive_dwell;
+    general_params->active_dwell[IWX_SCAN_HB_LMAC_IDX] = active_dwell;
+    general_params->passive_dwell[IWX_SCAN_HB_LMAC_IDX] = passive_dwell;
+}
+
+void ItlIwx::
+iwx_scan_umac_fill_general_p_v11(struct iwx_softc *sc,
+                                 struct iwx_scan_general_params_v11 *gp,
+                                 uint16_t gen_flags, int bgscan)
+{
+    iwx_scan_umac_dwell_v11(sc, gp, bgscan);
+    
+    gp->flags = htole16(gen_flags);
+    gp->scan_start_mac_or_link_id = 0;
+    
+    if (gen_flags & IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC1)
+        gp->num_of_fragments[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+    if (gen_flags & IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC2)
+        gp->num_of_fragments[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+}
+
+void ItlIwx::
+iwx_scan_umac_fill_ch_p_v7(struct iwx_softc *sc,
+                           struct iwx_scan_channel_params_v7 *cp,
+                           uint32_t channel_cfg_flags, bool active)
+{
+    cp->flags = IWX_SCAN_CHANNEL_FLAG_ENABLE_CHAN_ORDER;
+    
+    cp->count = iwx_umac_scan_fill_channels_v5(sc, cp->channel_config,
+                                               nitems(cp->channel_config),
+                                               active, channel_cfg_flags);
+    
+    cp->n_aps_override[0] = IWX_SCAN_ADWELL_N_APS_GO_FRIENDLY;
+    cp->n_aps_override[1] = IWX_SCAN_ADWELL_N_APS_SOCIAL_CHS;
+}
+
 int ItlIwx::
 iwx_umac_scan(struct iwx_softc *sc, int bgscan)
 {
@@ -13400,16 +14441,32 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
 #endif
     uint8_t scan_ver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC);
     
+    sc->sc_diag_scan_ver = scan_ver;
+    sc->sc_diag_scan_capa = sc->sc_capa_n_scan_channels;
+
+    if (scan_ver == 17) {
+        /*
+         * The v17 builder allocates a fixed-size command, so publish that
+         * size before sending: xd9's `sl` then distinguishes "went through
+         * v17" from the legacy 1812-byte payload without any extra property.
+         */
+        sc->sc_diag_scan_reqlen = (int)sizeof(struct iwx_scan_req_umac_v17);
+        return iwx_umac_scan_v17(sc, bgscan);
+    }
     if (scan_ver == 12)
         return iwx_umac_scan_v12(sc, bgscan);
     else if (scan_ver == 14)
         return iwx_umac_scan_v14(sc, bgscan);
     
     req_len = iwx_umac_scan_size(sc);
+    sc->sc_diag_scan_reqlen = (int)req_len;
     if ((req_len < IWX_SCAN_REQ_UMAC_SIZE_V1 +
          sizeof(struct iwx_scan_req_umac_tail_v1)) ||
-        req_len > IWX_MAX_CMD_PAYLOAD_SIZE)
+        req_len > IWX_MAX_CMD_PAYLOAD_SIZE) {
+        /* Negative marks "returned before the command was built". */
+        sc->sc_diag_scan_send_err = -(int)ERANGE;
         return ERANGE;
+    }
     req = (struct iwx_scan_req_umac *)malloc(req_len, 0,
                                              (async ? M_NOWAIT : M_WAITOK) | M_ZERO);
     if (req == NULL)
@@ -13557,6 +14614,7 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         err = iwx_fill_probe_req_v1(sc, &tailv1->preq);
     if (err) {
         ::free(req);
+        sc->sc_diag_scan_send_err = -(int)EIO;   /* probe request build failed */
         return err;
     }
     
@@ -13566,6 +14624,7 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
     
     err = iwx_send_cmd(sc, &hcmd);
     ::free(req);
+    sc->sc_diag_scan_send_err = err;
     return err;
 }
 
@@ -13819,6 +14878,116 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     
     err = iwx_send_cmd(sc, &hcmd);
     ::free(req);
+    return err;
+}
+
+/*
+ * SCAN_REQ_UMAC v17 (SC/Scarborough).
+ *
+ * Ported from OpenBSD if_iwx.c (iwx_umac_scan_v17) and checked against Linux
+ * mvm/scan.c, where version 17 is the same builder as 14 with the v11 general
+ * params and the v7 channel params. The command is a fixed-size struct, so
+ * unlike the legacy path there is no tail pointer arithmetic.
+ *
+ * Two deliberate deviations from the OpenBSD original, neither of which
+ * changes the wire format:
+ *   - the itlwm WCL channel selection filter lives inside
+ *     iwx_umac_scan_fill_channels_v5() (same as the v1 helper);
+ *   - the elapsed time of iwx_send_cmd() and its errno are published to the
+ *     IORegistry (sc_diag_scan_send_ms / sc_diag_scan_send_err) right after
+ *     the call. xd9's `se` is sampled in iwx_init_task, which is earlier than
+ *     this return, so without this the ack failure has no errno.
+ */
+int ItlIwx::
+iwx_umac_scan_v17(struct iwx_softc *sc, int bgscan)
+{
+    XYLog("%s\n", __FUNCTION__);
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwx_host_cmd hcmd = {
+        .id = iwx_cmd_id(IWX_SCAN_REQ_UMAC, IWX_LONG_GROUP, 0),
+        .len = { 0, },
+        .data = { NULL, },
+        .flags = 0,
+    };
+    struct iwx_scan_req_umac_v17 *cmd;
+    struct iwx_scan_req_params_v17 *scan_p;
+    int err, async = bgscan;
+    uint16_t gen_flags;
+    uint64_t t0 = 0, t1 = 0, elapsed_ns = 0;
+    /*
+     * Same active/passive decision as the v12/v14 builders. On a broadcast
+     * scan (ic_des_esslen == 0) WCL still wants probes, so "no destination
+     * SSID" must not be read as "passive": that set FORCE_PASSIVE and left
+     * every channel without SELECT_SSID, so the firmware dwelt the full
+     * IWL_SCAN_DWELL_PASSIVE (110 TU) on all 38 channels.
+     */
+    bool scanActive = ic->ic_des_esslen != 0 && !bgscan;
+#ifdef AIRPORT_WCL
+    scanActive = AirportWCL::scanUsesProbes(ic->ic_wcl_scan_requested,
+                                            ic->ic_wcl_scan_active);
+#endif
+    
+    /* v11 general params and v7 channel params must not change size. */
+    static_assert(sizeof(struct iwx_scan_req_umac_v17) == 1940,
+                  "SCAN_REQUEST_CMD_UMAC_API_S_VER_17 layout");
+    static_assert(sizeof(struct iwx_scan_req_umac_v17) ==
+                  sizeof(struct iwx_scan_req_umac_v14),
+                  "v17 and v14 command sizes must match");
+    static_assert(sizeof(struct iwx_scan_channel_cfg_umac_v5) == 8,
+                  "SCAN_CHANNEL_CONFIG_API_S_VER_5 layout");
+    static_assert(sizeof(struct iwx_scan_general_params_v11) == 36,
+                  "SCAN_GENERAL_PARAMS_API_S_VER_11 layout");
+    
+    cmd = (struct iwx_scan_req_umac_v17 *)malloc(sizeof(*cmd), 0,
+            (async ? M_NOWAIT : M_WAITOK) | M_ZERO);
+    if (cmd == NULL) {
+        sc->sc_diag_scan_send_err = ENOMEM;
+        iwx_publish_diag(sc);
+        return ENOMEM;
+    }
+    
+    scan_p = &cmd->scan_params;
+    
+    cmd->ooc_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
+    cmd->uid = htole32(0);
+    
+    gen_flags = iwx_scan_umac_flags_v2(sc, bgscan, scanActive);
+    iwx_scan_umac_fill_general_p_v11(sc, &scan_p->general_params,
+                                     gen_flags, bgscan);
+    
+    scan_p->periodic_params.schedule[0].interval = htole16(0);
+    scan_p->periodic_params.schedule[0].iter_count = 1;
+    
+    err = iwx_fill_probe_req(sc, &scan_p->probe_params.preq);
+    if (err) {
+        ::free(cmd);
+        sc->sc_diag_scan_send_err = -(int)EIO;   /* probe request build failed */
+        iwx_publish_diag(sc);
+        return err;
+    }
+    
+    if (ic->ic_des_esslen != 0) {
+        scan_p->probe_params.direct_scan[0].id = IEEE80211_ELEMID_SSID;
+        scan_p->probe_params.direct_scan[0].len = ic->ic_des_esslen;
+        memcpy(scan_p->probe_params.direct_scan[0].ssid,
+               ic->ic_des_essid, ic->ic_des_esslen);
+    }
+    
+    iwx_scan_umac_fill_ch_p_v7(sc, &scan_p->channel_params, 0, scanActive);
+    
+    hcmd.len[0] = sizeof(*cmd);
+    hcmd.data[0] = (void *)cmd;
+    hcmd.flags |= async ? IWX_CMD_ASYNC : 0;
+    
+    clock_get_uptime(&t0);
+    err = iwx_send_cmd(sc, &hcmd);
+    clock_get_uptime(&t1);
+    absolutetime_to_nanoseconds(t1 - t0, &elapsed_ns);
+    sc->sc_diag_scan_send_ms = (int)(elapsed_ns / 1000000ULL);
+    sc->sc_diag_scan_send_err = err;
+    iwx_publish_diag(sc);
+    
+    ::free(cmd);
     return err;
 }
 
@@ -14183,6 +15352,405 @@ iwx_mac_ctxt_cmd_fill_sta(struct iwx_softc *sc, struct iwx_node *in,
     sta->assoc_beacon_arrive_time = htole32(ni->ni_rstamp);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * MLD API (MAC_CONF_GROUP 0x03)
+ * ---------------------------------------------------------------------------
+ *
+ * Ported from OpenBSD if_iwx.c: iwx_mld_mac_ctxt_cmd() 8108, iwx_mld_modify_
+ * link_fill() 6953, iwx_mld_add_sta_cmd() 7039, iwx_mld_rm_sta_cmd() 7254.
+ *
+ * sc-a0's CMD_VERSIONS table registers MAC_CONFIG v3 / LINK_CONFIG v7 /
+ * STA_CONFIG v2 under group 0x03 and lists no MAC_CONTEXT command anywhere
+ * that accepts them, which is why 0x128 (group 1) and 0xE28 (group 14) both
+ * time out. Linux sends these with a zero version byte
+ * (iwl_mvm_send_cmd_pdu(..., WIDE_ID(MAC_CONF_GROUP, MAC_CONFIG_CMD), 0, ...)),
+ * so the version nibble in the header is deliberately left at 0 here too.
+ */
+
+int ItlIwx::
+iwx_mld_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in,
+                     uint32_t action, int assoc)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = &in->in_ni;
+    struct iwx_mac_config_cmd cmd;
+    int err;
+    
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.id_and_color = htole32(in->in_id);
+    cmd.action = htole32(action);
+    
+    if (action == IWX_FW_CTXT_ACTION_REMOVE) {
+        err = iwx_send_cmd_pdu(sc,
+              iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+              sizeof(cmd), &cmd);
+        sc->sc_diag_mld_mac_err = err;
+        if (err)
+            XYLog("%s: could not remove MAC (error %d)\n", __FUNCTION__, err);
+        return err;
+    }
+    
+    if (ic->ic_opmode == IEEE80211_M_MONITOR)
+        cmd.mac_type = htole32(IWX_FW_MAC_TYPE_LISTENER);
+    else if (ic->ic_opmode == IEEE80211_M_STA)
+        cmd.mac_type = htole32(IWX_FW_MAC_TYPE_BSS_STA);
+    else {
+        XYLog("%s: unsupported operating mode %d\n", __FUNCTION__,
+              ic->ic_opmode);
+        return EINVAL;
+    }
+    
+    IEEE80211_ADDR_COPY(cmd.local_mld_addr, ic->ic_myaddr);
+    cmd.client.assoc_id = htole32(IEEE80211_AID(ni->ni_associd));
+    cmd.client.is_assoc = assoc ? 1 : 0;
+    
+    cmd.filter_flags = htole32(IWX_MAC_CFG_FILTER_ACCEPT_GRP);
+    if (ic->ic_opmode == IEEE80211_M_MONITOR) {
+        cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_PROMISC |
+                                    IWX_MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT |
+                                    IWX_MAC_CFG_FILTER_ACCEPT_BEACON |
+                                    IWX_MAC_CFG_FILTER_ACCEPT_PROBE_REQ);
+    } else if (!assoc || !ni->ni_associd || !ni->ni_dtimperiod) {
+        cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
+    }
+    
+    /*
+     * HE defaults; sc-a0 is an 11ax part. eht_support stays 0 because this
+     * port does not associate as an EHT (11be) station yet.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA) {
+        cmd.he_support = 1;
+        cmd.eht_support = 0;
+    }
+    
+    err = iwx_send_cmd_pdu(sc,
+          iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+          sizeof(cmd), &cmd);
+    sc->sc_diag_mld_mac_err = err;
+    if (err)
+        XYLog("%s: could not send MAC_CONFIG (action %u, error %d)\n",
+              __FUNCTION__, action, err);
+    return err;
+}
+
+void ItlIwx::
+iwx_mld_modify_link_fill(struct iwx_softc *sc, struct iwx_node *in,
+                         struct iwx_link_config_cmd *cmd, int changes,
+                         int active)
+{
+#define IWX_EXP2(x)    ((1 << (x)) - 1)    /* CWmin = 2^ECWmin - 1 */
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = &in->in_ni;
+    int cck_ack_rates, ofdm_ack_rates, i;
+    
+    cmd->link_id = htole32(IWX_MLD_LINK_ID);
+    cmd->mac_id = htole32(in->in_id);
+    cmd->phy_id = htole32(in->in_phyctxt ? in->in_phyctxt->id
+                                         : IWX_FW_CTXT_INVALID);
+    IEEE80211_ADDR_COPY(cmd->local_link_addr, ic->ic_myaddr);
+    cmd->active = htole32(active);
+    
+    iwx_ack_rates(sc, in, &cck_ack_rates, &ofdm_ack_rates);
+    cmd->cck_rates = htole32(cck_ack_rates);
+    cmd->ofdm_rates = htole32(ofdm_ack_rates);
+    cmd->cck_short_preamble
+        = htole32((ic->ic_flags & IEEE80211_F_SHPREAMBLE) ? 1 : 0);
+    cmd->short_slot
+        = htole32((ic->ic_flags & IEEE80211_F_SHSLOT) ? 1 : 0);
+    
+    for (i = 0; i < EDCA_NUM_AC; i++) {
+        struct ieee80211_edca_ac_params *ac = &ic->ic_edca_ac[i];
+        int txf = (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+                  ? iwx_ac_to_bz_tx_fifo[i] : iwx_ac_to_tx_fifo[i];
+        
+        cmd->ac[txf].cw_min = htole16(IWX_EXP2(ac->ac_ecwmin));
+        cmd->ac[txf].cw_max = htole16(IWX_EXP2(ac->ac_ecwmax));
+        cmd->ac[txf].aifsn = ac->ac_aifsn;
+        cmd->ac[txf].fifos_mask = (1 << txf);
+        cmd->ac[txf].edca_txop = htole16(ac->ac_txoplimit * 32);
+    }
+    if (ni->ni_flags & IEEE80211_NODE_QOS)
+        cmd->qos_flags |= htole32(IWX_MAC_QOS_FLG_UPDATE_EDCA);
+    
+    if (ni->ni_flags & IEEE80211_NODE_HT) {
+        enum ieee80211_htprot htprot =
+        (enum ieee80211_htprot)(ni->ni_htop1 & IEEE80211_HTOP1_PROT_MASK);
+        
+        /* LINK_CONFIG uses its own protection encoding (bits 0..3). */
+        switch (htprot) {
+        case IEEE80211_HTPROT_NONE:
+            break;
+        case IEEE80211_HTPROT_NONMEMBER:
+        case IEEE80211_HTPROT_NONHT_MIXED:
+            cmd->protection_flags |= htole32(IWX_LINK_PROT_FLG_HT_PROT |
+                                             IWX_LINK_PROT_FLG_FAT_PROT);
+            break;
+        case IEEE80211_HTPROT_20MHZ:
+            /*
+             * OpenBSD keys this off the PHY context's secondary-channel
+             * offset; this port's struct iwx_phy_ctxt has no sco field, so use
+             * the same channel-width test iwx_mac_ctxt_cmd_common() uses.
+             */
+            if (ni->ni_chw > IEEE80211_CHAN_WIDTH_20)
+                cmd->protection_flags |= htole32(IWX_LINK_PROT_FLG_HT_PROT |
+                                                 IWX_LINK_PROT_FLG_FAT_PROT);
+            break;
+        default:
+            break;
+        }
+        cmd->qos_flags |= htole32(IWX_MAC_QOS_FLG_TGN);
+    }
+    if (ic->ic_flags & IEEE80211_F_USEPROT)
+        cmd->protection_flags |= htole32(IWX_LINK_PROT_FLG_TGG_PROTECT);
+    
+    cmd->bi = htole32(ni->ni_intval);
+    cmd->dtim_interval = htole32(ni->ni_intval * ni->ni_dtimperiod);
+    
+    cmd->modify_mask = htole32(changes);
+    cmd->flags = 0;
+    cmd->flags_mask = 0;
+    cmd->spec_link_id = 0;
+    cmd->listen_lmac = 0;
+    cmd->action = htole32(IWX_FW_CTXT_ACTION_MODIFY);
+#undef IWX_EXP2
+}
+
+int ItlIwx::
+iwx_mld_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = &in->in_ni;
+    struct iwx_link_config_cmd link;
+    struct iwx_sta_cfg_cmd_v1 sta_v1;
+    struct iwx_sta_cfg_cmd_v2 sta;
+    uint32_t agg_size = 0, mpdu_dens = 0;
+    uint32_t max_aggsize =
+    (IWX_STA_FLG_MAX_AGG_SIZE_4M >> IWX_STA_FLG_MAX_AGG_SIZE_SHIFT);
+    int err, changes, ver;
+    
+    ver = iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_STA_CONFIG_CMD);
+    if (ver != 1 && ver != 2 && ver != IWX_FW_CMD_VER_UNKNOWN) {
+        XYLog("%s: unsupported STA_CONFIG_CMD version %d\n", __FUNCTION__, ver);
+        return ENOTSUP;
+    }
+    
+    memset(&link, 0, sizeof(link));
+    memset(&sta_v1, 0, sizeof(sta_v1));
+    memset(&sta, 0, sizeof(sta));
+    
+    /* MLD firmware has no binding context: the link is added first. */
+    if (!update) {
+        link.action = htole32(IWX_FW_CTXT_ACTION_ADD);
+        link.link_id = htole32(IWX_MLD_LINK_ID);
+        link.mac_id = htole32(in->in_id);
+        link.spec_link_id = 0;
+        link.phy_id = htole32(in->in_phyctxt ? in->in_phyctxt->id
+                                             : IWX_FW_CTXT_INVALID);
+        IEEE80211_ADDR_COPY(link.local_link_addr, ic->ic_myaddr);
+        link.listen_lmac = 0;
+        
+        err = iwx_send_cmd_pdu(sc,
+              iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+              sizeof(link), &link);
+        sc->sc_diag_mld_link_err = err;
+        if (err) {
+            XYLog("%s: could not add link (error %d)\n", __FUNCTION__, err);
+            return err;
+        }
+    }
+    
+    changes = IWX_LINK_CONTEXT_MODIFY_ACTIVE |
+              IWX_LINK_CONTEXT_MODIFY_RATES_INFO;
+    if (update)
+        changes |= IWX_LINK_CONTEXT_MODIFY_PROTECT_FLAGS |
+                   IWX_LINK_CONTEXT_MODIFY_QOS_PARAMS |
+                   IWX_LINK_CONTEXT_MODIFY_BEACON_TIMING;
+    
+    memset(&link, 0, sizeof(link));
+    iwx_mld_modify_link_fill(sc, in, &link, changes, 1);
+    err = iwx_send_cmd_pdu(sc,
+          iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+          sizeof(link), &link);
+    sc->sc_diag_mld_link_err = err;
+    if (err) {
+        XYLog("%s: could not modify link (error %d)\n", __FUNCTION__, err);
+        return err;
+    }
+    
+    if (ic->ic_opmode == IEEE80211_M_MONITOR) {
+        sta.sta_id = htole32(IWX_MONITOR_STA_ID);
+        sta.station_type = htole32(IWX_STATION_TYPE_BCAST_MGMT);
+    } else {
+        sta.sta_id = htole32(IWX_STATION_ID);
+        sta.station_type = htole32(IWX_STATION_TYPE_PEER);
+    }
+    sta.link_id = htole32(IWX_MLD_LINK_ID);
+    IEEE80211_ADDR_COPY(sta.peer_mld_address, ni->ni_macaddr);
+    IEEE80211_ADDR_COPY(sta.peer_link_address, ni->ni_bssid);
+    sta.assoc_id = htole32(IEEE80211_AID(ni->ni_associd));
+    
+    if ((ni->ni_flags & IEEE80211_NODE_HT) ||
+        (ni->ni_flags & IEEE80211_NODE_VHT) ||
+        (ni->ni_flags & IEEE80211_NODE_HE)) {
+        if (iwx_mimo_enabled(sc) && ni->ni_rx_nss > 1)
+            sta.mimo = htole32(1);
+        
+        /*
+         * Same arithmetic as iwx_add_sta_cmd() above; the difference is that
+         * STA_CONFIG wants the plain exponents instead of a flags word.
+         */
+        if (ni->ni_flags & IEEE80211_NODE_HE) {
+            agg_size = ni->ni_vhtcaps &
+                IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK;
+            agg_size >>=
+                IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT;
+            agg_size += u8_get_bits(ni->ni_he_cap_elem.mac_cap_info[3],
+                        IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_MASK);
+        } else if (ni->ni_flags & IEEE80211_NODE_VHT) {
+            agg_size = ni->ni_vhtcaps &
+                IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK;
+            agg_size >>=
+                IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT;
+        } else {
+            agg_size = IWX_STA_FLG_MAX_AGG_SIZE_64K >>
+                IWX_STA_FLG_MAX_AGG_SIZE_SHIFT;
+        }
+        if (agg_size > max_aggsize)
+            agg_size = max_aggsize;
+        
+        mpdu_dens = (ic->ic_ampdu_params & IEEE80211_AMPDU_PARAM_SS) >> 2;
+        
+        sta.tx_ampdu_spacing = htole32(mpdu_dens);
+        sta.tx_ampdu_max_size = htole32(agg_size);
+    }
+    if (ni->ni_flags & IEEE80211_NODE_MFP)
+        sta.mfp = htole32(1);
+    if (ni->ni_flags & IEEE80211_NODE_HE)
+        sta.htc_flags = htole32(IWX_HE_HTC_SUPPORT);
+    if (ni->ni_flags & IEEE80211_NODE_QOS)
+        sta.sp_length = htole32(128);    /* Linux: max_sp ? max_sp * 2 : 128 */
+    
+    if (ver == 1) {
+        memcpy(&sta_v1, &sta, sizeof(sta_v1));
+        err = iwx_send_cmd_pdu(sc,
+              iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+              sizeof(sta_v1), &sta_v1);
+    } else {
+        err = iwx_send_cmd_pdu(sc,
+              iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+              sizeof(sta), &sta);
+    }
+    sc->sc_diag_mld_sta_err = err;
+    if (err)
+        XYLog("%s: could not send STA_CONFIG (error %d)\n", __FUNCTION__, err);
+    return err;
+}
+
+int ItlIwx::
+iwx_mld_rm_sta_cmd(struct iwx_softc *sc, struct iwx_node *in)
+{
+    struct iwx_sta_remove_cmd sta_cmd;
+    struct iwx_link_config_cmd link_cmd;
+    int err;
+    
+    /*
+     * sc-a0's CMD_VERSIONS table has no entry at all for
+     * (MAC_CONF_GROUP, STA_REMOVE_CMD): group 3 advertises 0x05/0x06/0x08/
+     * 0x09/0x0a/0x0e/0x10 only.  The firmware silently drops the command,
+     * so every deauth costs a full 1 s EWOULDBLOCK *and* -- because the
+     * original code returned early -- the link context was never removed,
+     * leaving stale state behind for the next join.  Only send it when the
+     * running firmware actually advertises it; the link removal below is
+     * what really tears the MLD station down.
+     */
+    if (iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_STA_REMOVE_CMD) !=
+        IWX_FW_CMD_VER_UNKNOWN) {
+        memset(&sta_cmd, 0, sizeof(sta_cmd));
+        sta_cmd.sta_id = htole32(IWX_STATION_ID);
+        err = iwx_send_cmd_pdu(sc,
+              iwx_cmd_id(IWX_STA_REMOVE_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+              sizeof(sta_cmd), &sta_cmd);
+        if (err) {
+            sc->sc_diag_mld_rm_err = err;
+            XYLog("%s: could not remove sta (error %d)\n", __FUNCTION__, err);
+            return err;
+        }
+    }
+    
+    memset(&link_cmd, 0, sizeof(link_cmd));
+    iwx_mld_modify_link_fill(sc, in, &link_cmd,
+                             IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0);
+    err = iwx_send_cmd_pdu(sc,
+          iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+          sizeof(link_cmd), &link_cmd);
+    if (err)
+        return err;
+    
+    memset(&link_cmd, 0, sizeof(link_cmd));
+    link_cmd.link_id = htole32(IWX_MLD_LINK_ID);
+    link_cmd.spec_link_id = 0;
+    link_cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
+    err = iwx_send_cmd_pdu(sc,
+          iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0,
+          sizeof(link_cmd), &link_cmd);
+    sc->sc_diag_mld_rm_err = err;
+    if (err)
+        XYLog("%s: could not remove link (error %d)\n", __FUNCTION__, err);
+    return err;
+}
+
+int ItlIwx::
+iwx_mld_set_key(struct iwx_softc *sc, struct ieee80211_node *ni,
+                struct ieee80211_key *k, uint32_t action)
+{
+    struct iwx_sec_key_cmd cmd;
+    uint32_t flags = IWX_SEC_KEY_FLAG_CIPHER_CCMP;
+    int err;
+    
+    if (k->k_flags & IEEE80211_KEY_GROUP)
+        flags |= IWX_SEC_KEY_FLAG_MCAST_KEY;
+    else if (ni->ni_flags & IEEE80211_NODE_MFP)
+        flags |= IWX_SEC_KEY_FLAG_MFP;
+    
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.action = htole32(action);
+    if (action == IWX_FW_CTXT_ACTION_REMOVE) {
+        cmd.u.remove.sta_mask = htole32(1 << IWX_STATION_ID);
+        cmd.u.remove.key_id = htole32(k->k_id);
+        cmd.u.remove.key_flags = htole32(flags);
+    } else {
+        cmd.u.add.sta_mask = htole32(1 << IWX_STATION_ID);
+        cmd.u.add.key_id = htole32(k->k_id);
+        cmd.u.add.key_flags = htole32(flags);
+        memcpy(cmd.u.add.key, k->k_key,
+               MIN(sizeof(cmd.u.add.key), k->k_len));
+        cmd.u.add.tx_seq = htole64(k->k_tsc);
+    }
+    
+    /*
+     * ic_set_key() is reached from iwx_notif_intr() -> ieee80211_inputm()
+     * while the interrupt event source is running on the main workloop.
+     * A synchronous command there sleeps on the command gate and blocks
+     * the very workloop that has to deliver the ack: v338 real machine
+     * showed xd10="id=0x518 e=35" (1 s EWOULDBLOCK), and the following
+     * teardown MAC_CONFIG 0x308 also timed out. The legacy ADD_STA_KEY
+     * path above is already IWX_CMD_ASYNC; use the same fire-and-forget
+     * form here so the key reaches the firmware without sleeping in RX.
+     */
+    err = iwx_send_cmd_pdu(sc,
+          iwx_cmd_id(IWX_SEC_KEY_CMD, IWX_DATA_PATH_GROUP, 0),
+          IWX_CMD_ASYNC, sizeof(cmd), &cmd);
+    sc->sc_diag_mld_key_err = err;
+    if (err)
+        XYLog("%s: could not send SEC_KEY (action %u, error %d)\n",
+              __FUNCTION__, action, err);
+    else
+        XYLog("%s: SEC_KEY action=%u key_id=%u flags=0x%x async\n",
+              __FUNCTION__, action, k->k_id, flags);
+    return err;
+}
+
 int ItlIwx::
 iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
                  int assoc)
@@ -14200,6 +15768,15 @@ iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
         XYLog("MAC already removed\n");
         return 0;
     }
+    
+    /*
+     * MLD firmware has no MAC_CONTEXT_CMD at all: association goes through
+     * MAC_CONFIG_CMD in MAC_CONF_GROUP (0x03).  Everything below this point is
+     * the legacy path and stays untouched for AX210 and 22000, whose firmware
+     * does not set IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT.
+     */
+    if (sc->sc_use_mld_api)
+        return iwx_mld_mac_ctxt_cmd(sc, in, action, assoc);
     
     memset(&cmd, 0, sizeof(cmd));
     
@@ -14386,11 +15963,15 @@ iwx_scan(struct iwx_softc *sc)
     struct _ifnet *ifp = IC2IFP(ic);
     int err;
     
+    sc->sc_diag_scan_calls++;
+    
     if (sc->sc_flags & IWX_FLAG_BGSCAN) {
         err = iwx_scan_abort(sc);
         if (err) {
             XYLog("%s: could not abort background scan\n",
                   DEVNAME(sc));
+            if (sc->sc_diag_scan_err == 0x7fffffff)
+                sc->sc_diag_scan_err = err;
             return err;
         }
     }
@@ -14398,6 +15979,8 @@ iwx_scan(struct iwx_softc *sc)
     err = iwx_umac_scan(sc, 0);
     if (err) {
         XYLog("%s: could not initiate scan\n", DEVNAME(sc));
+        if (sc->sc_diag_scan_err == 0x7fffffff)
+            sc->sc_diag_scan_err = err;
         return err;
     }
     
@@ -14472,11 +16055,44 @@ iwx_enable_mgmt_queue(struct iwx_softc *sc)
     int err;
     int cmdver;
 
-    cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
-    if (cmdver != IWX_FW_CMD_VER_UNKNOWN && cmdver >= 12)
-        sc->first_data_qid = IWX_QID_MGMT - 1;
-    else
-        sc->first_data_qid = IWX_QID_MGMT;
+    /*
+     * Which host queue carries the management (non-QoS) TID depends on whether
+     * the firmware owns an auxiliary station.
+     *
+     * Older firmware needs an explicit aux station (IWX_AUX_STA_ID) sitting on
+     * queue IWX_DQA_AUX_QUEUE (1), so non-QoS frames of the BSS station land on
+     * the next queue: IWX_QID_MGMT == 2.  Firmware that advertises ADD_STA >= 12
+     * owns the aux station instead, which is why the legacy gate bumps the
+     * index down by one.
+     *
+     * Bz/SC firmware also owns the aux station, but the "modern firmware" gate
+     * never fires there: sc-a0 advertises no (LONG_GROUP, ADD_STA) entry, the
+     * lookup returns UNKNOWN, and the pre-SC layout is picked.  This driver
+     * does not send an aux ADD_STA on SC at all (see iwx_add_aux_sta: the
+     * command was silently dropped, xd10 "id=0x118 e=35"), so queue 1 is free
+     * and the management queue belongs there -- IWX_DQA_CMD_QUEUE + 1.
+     *
+     * OpenBSD master does exactly this, unconditionally, because it never
+     * creates an aux station on any device (ob-if_iwx.c:8479):
+     *     sc->first_data_qid = IWX_DQA_CMD_QUEUE + 1;
+     *
+     * Live evidence that queue 2 is wrong here (v336): the firmware assigned
+     * queue 1, the ring rejected the mismatch with EIO(5), and the join died
+     * with "requested qid 2 but 1 was assigned" ->
+     * "could not enable MGMT Tx queue 2 (error 5)".  Asking for 1 also keeps
+     * the host ring index and the firmware queue number identical, which the
+     * rest of this driver still relies on (hdr_wide.qid / HBUS_TARG_WRPTR are
+     * built from ring->qid).
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        sc->first_data_qid = IWX_DQA_CMD_QUEUE + 1;
+    } else {
+        cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
+        if (cmdver != IWX_FW_CMD_VER_UNKNOWN && cmdver >= 12)
+            sc->first_data_qid = IWX_QID_MGMT - 1;
+        else
+            sc->first_data_qid = IWX_QID_MGMT;
+    }
     err = iwx_enable_txq(sc, IWX_STATION_ID,
                          sc->first_data_qid, IWX_MGMT_TID,
                          sc->txq[sc->first_data_qid].ring_count);
@@ -15453,7 +17069,12 @@ iwx_run(struct iwx_softc *sc)
         return err;
     }
     
-    if (!isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_DYNAMIC_QUOTA)) {
+    /*
+     * MLD firmware carries quotas and HE parameters in LINK_CONFIG_CMD, and
+     * its TIME_QUOTA command is not in the MAC_CONF_GROUP set at all.
+     */
+    if (!sc->sc_use_mld_api &&
+        !isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_DYNAMIC_QUOTA)) {
         err = iwx_update_quotas(sc, in, 1);
         if (err) {
             XYLog("%s: could not update quotas (error %d)\n",
@@ -15476,9 +17097,17 @@ iwx_run(struct iwx_softc *sc)
         return err;
     }
     
-    err = iwx_config_he_sta(sc, &in->in_ni);
-    if (err)
-        return err;
+    /*
+     * MLD: the HE capabilities belong to LINK_CONFIG_CMD (MODIFY_HE_PARAMS),
+     * which this port does not send yet, and STA_HE_CTXT_CMD is not declared
+     * by sc-a0 at all. Skipping here keeps the association sequence free of a
+     * command the firmware would silently drop.
+     */
+    if (!sc->sc_use_mld_api) {
+        err = iwx_config_he_sta(sc, &in->in_ni);
+        if (err)
+            return err;
+    }
     err = iwx_rs_init(sc, in, true);
     if (err) {
         XYLog("%s: could not update rate scaling (error %d)\n",
@@ -16436,6 +18065,10 @@ iwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
         return (ieee80211_set_key(ic, ni, k));
     }
     
+    /* MLD firmware takes the key through SEC_KEY_CMD (DATA_PATH_GROUP). */
+    if (sc->sc_use_mld_api)
+        return that->iwx_mld_set_key(sc, ni, k, IWX_FW_CTXT_ACTION_ADD);
+    
     memset(&cmd, 0, sizeof(cmd));
     
     cmd.common.key_flags = htole16(IWX_STA_KEY_FLG_CCM |
@@ -16468,6 +18101,12 @@ iwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     if (k->k_cipher != IEEE80211_CIPHER_CCMP) {
         /* Fallback to software crypto for other ciphers. */
         ieee80211_delete_key(ic, ni, k);
+        return;
+    }
+    
+    /* MLD firmware removes the key through SEC_KEY_CMD as well. */
+    if (sc->sc_use_mld_api) {
+        (void)that->iwx_mld_set_key(sc, ni, k, IWX_FW_CTXT_ACTION_REMOVE);
         return;
     }
     
@@ -16539,6 +18178,8 @@ iwx_newstate_task(void *psc)
     int generation = sc->sc_generation;
     int arg = sc->ns_arg;
     int err = 0, s = splnet();
+    
+    sc->sc_diag_newstate_bodies++;
     
     XYLog("%s sc->sc_flags & IWX_FLAG_SHUTDOWN %s\n", __FUNCTION__, sc->sc_flags & IWX_FLAG_SHUTDOWN ? "true" : "false");
     if (sc->sc_flags & IWX_FLAG_SHUTDOWN) {
@@ -16640,6 +18281,9 @@ iwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
     ItlIwx *that = container_of(sc, ItlIwx, com);
     struct ieee80211_node *ni = ic->ic_bss;
     
+    sc->sc_diag_newstate_calls++;
+    sc->sc_diag_newstate_last = (int)nstate;
+    
     // The AWDL receive test stays on its channels whatever macOS asks for.
     if (awdlRx && ic->ic_state == IEEE80211_S_RUN &&
         (nstate == IEEE80211_S_SCAN || nstate == IEEE80211_S_AUTH || nstate == IEEE80211_S_ASSOC))
@@ -16683,6 +18327,26 @@ iwx_endscan(struct iwx_softc *sc)
     struct ieee80211com *ic = &sc->sc_ic;
     
     struct ieee80211_node *ni, *nextbs;
+    
+    /*
+     * xe3: snapshot the node table before ieee80211_end_scan() prunes it.
+     * nnodes is every node net80211 knows; nessid is the subset that carries
+     * an SSID, i.e. was really built from a beacon or probe response. A large
+     * nnodes with a small nessid means nodes exist only for addresses we
+     * talked to, and no scan result was ever recorded.
+     */
+    {
+        int nnodes = 0, nessid = 0;
+        ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
+        for (; ni != NULL;
+             ni = RB_NEXT(ieee80211_tree, &ic->ic_tree, ni)) {
+            ++nnodes;
+            if (ni->ni_esslen != 0)
+                ++nessid;
+        }
+        sc->sc_diag_scan_nodes = nnodes;
+        sc->sc_diag_scan_essid = nessid;
+    }
     
 //    ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
 //    for (; ni != NULL; ni = nextbs) {
@@ -17363,6 +19027,8 @@ iwx_init_hw(struct iwx_softc *sc)
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     int err, i, generation = sc->sc_generation;
+    int first_err = 0;      /* DIAGNOSTIC: first failing step, see below */
+    int nfail = 0;          /* DIAGNOSTIC: how many steps failed */
     
     err = iwx_preinit(sc);
     if (err)
@@ -17381,11 +19047,34 @@ iwx_init_hw(struct iwx_softc *sc)
     if (!iwx_nic_lock(sc))
         return EBUSY;
     
+    /*
+     * DIAGNOSTIC: keep walking the init sequence after a failed command.
+     *
+     * Every step below is an independent firmware command with its own 1 s ack
+     * timeout, and a failure only means "this command was not acknowledged".
+     * Aborting at the first one is exactly why the last two boots each named a
+     * single command (xd10 0x118 -> 0x108) and needed a reboot per command.
+     * On the success path nothing changes (no step fails => same behaviour);
+     * on the failure path every remaining command still gets one attempt, so a
+     * single boot names them all (xd13 lists the ids).
+     *
+     * Bounded by IWX_INIT_MAX_CONT so a genuinely wedged firmware cannot add
+     * one second per remaining command; first_err is still returned, so
+     * iwx_init() fails exactly as before.
+     */
+#define IWX_INIT_MAX_CONT   8
+#define IWX_INIT_CONT() do {                                    \
+        if (!first_err)                                         \
+            first_err = err;                                    \
+        if (++nfail >= IWX_INIT_MAX_CONT)                       \
+            goto err;                                           \
+    } while (0)
+
     err = iwx_send_tx_ant_cfg(sc, iwx_fw_valid_tx_ant(sc));
     if (err) {
         XYLog("%s: could not init tx ant config (error %d)\n",
                DEVNAME(sc), err);
-        goto err;
+        IWX_INIT_CONT();
     }
     
     iwx_toggle_tx_ant(sc, &sc->sc_mgmt_last_antenna_idx);
@@ -17395,7 +19084,7 @@ iwx_init_hw(struct iwx_softc *sc)
         if (err) {
             XYLog("%s: could not send phy config (error %d)\n",
                    DEVNAME(sc), err);
-            goto err;
+            IWX_INIT_CONT();
         }
     }
     
@@ -17403,17 +19092,17 @@ iwx_init_hw(struct iwx_softc *sc)
     if (err) {
         XYLog("%s: could not init bt coex (error %d)\n",
                DEVNAME(sc), err);
-        goto err;
+        IWX_INIT_CONT();
     }
     
     err = iwx_send_soc_conf(sc);
     if (err)
-        goto err;
+        IWX_INIT_CONT();
     
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_DQA_SUPPORT)){
         err = iwx_send_dqa_cmd(sc);
         if (err)
-            goto err;
+            IWX_INIT_CONT();
     }
     
     /* Add auxiliary station for scanning */
@@ -17421,7 +19110,7 @@ iwx_init_hw(struct iwx_softc *sc)
     if (err) {
         XYLog("%s: could not add aux station (error %d)\n",
               DEVNAME(sc), err);
-        goto err;
+        IWX_INIT_CONT();
     }
     
     for (i = 0; i < IWX_NUM_PHY_CTX; i++) {
@@ -17437,7 +19126,7 @@ iwx_init_hw(struct iwx_softc *sc)
         if (err) {
             XYLog("%s: could not add phy context %d (error %d)\n",
                    DEVNAME(sc), i, err);
-            goto err;
+            IWX_INIT_CONT();
         }
     }
     
@@ -17446,21 +19135,21 @@ iwx_init_hw(struct iwx_softc *sc)
         if (err) {
             XYLog("%s: PCIe LTR configuration failed (error %d)\n",
                   DEVNAME(sc), err);
-            goto err;
+            IWX_INIT_CONT();
         }
     }
     
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CT_KILL_BY_FW)) {
         err = iwx_send_temp_report_ths_cmd(sc);
         if (err)
-            goto err;
+            IWX_INIT_CONT();
     }
     
     err = iwx_power_update_device(sc);
     if (err) {
         XYLog("%s: could not send power command (error %d)\n",
                DEVNAME(sc), err);
-        goto err;
+        IWX_INIT_CONT();
     }
     
     if (sc->sc_nvm.lar_enabled) {
@@ -17474,7 +19163,7 @@ iwx_init_hw(struct iwx_softc *sc)
         if (err) {
             XYLog("%s: could not init LAR (error %d)\n",
                    DEVNAME(sc), err);
-            goto err;
+            IWX_INIT_CONT();
         }
         if (mccProbe && !timeout_pending(&mccProbeTimer))
             timeout_add_sec(&mccProbeTimer, 5);
@@ -17484,16 +19173,22 @@ iwx_init_hw(struct iwx_softc *sc)
     if (err) {
         XYLog("%s: could not configure scan (error %d)\n",
                DEVNAME(sc), err);
-        goto err;
+        IWX_INIT_CONT();
     }
     
     err = iwx_disable_beacon_filter(sc);
     if (err) {
         XYLog("%s: could not disable beacon filter (error %d)\n",
                DEVNAME(sc), err);
-        goto err;
+        IWX_INIT_CONT();
     }
     
+#undef IWX_INIT_CONT
+
+    /* DIAGNOSTIC: the sequence kept going, but iwx_init() must still fail. */
+    if (first_err && !err)
+        err = first_err;
+
 err:
     if (generation == sc->sc_generation)
         iwx_nic_unlock(sc);
@@ -17541,6 +19236,9 @@ iwx_init(struct _ifnet *ifp)
     struct iwx_softc *sc = (struct iwx_softc *)ifp->if_softc;
     struct ieee80211com *ic = &sc->sc_ic;
     int err, generation;
+
+    /* Scan bring-up counter; published through xd9. */
+    sc->sc_diag_init_calls++;
     int i;
 
     memset(sc->sc_tid_data, 0, sizeof(sc->sc_tid_data));
@@ -17627,6 +19325,7 @@ iwx_init(struct _ifnet *ifp)
     }
     
     ieee80211_begin_scan(ifp);
+    sc->sc_diag_begin_scan_done = 1;   /* xd11: iwx_init_hw() succeeded */
     
     /*
      * ieee80211_begin_scan() ends up scheduling iwx_newstate_task().
@@ -18295,7 +19994,8 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
          * LEGACY group. Firmware API versions >= 50 reject commands
          * in group 0, forcing us to use this hack.
          */
-        if (iwx_cmd_groupid(code) == IWX_LONG_GROUP &&
+        if ((iwx_cmd_groupid(code) == IWX_LONG_GROUP ||
+             iwx_cmd_groupid(code) == IWX_ALWAYS_LONG_GROUP) &&
             qid == IWX_DQA_CMD_QUEUE && idx < sc->txq[qid].ring_count) {
             struct iwx_tx_ring *ring = &sc->txq[qid];
             struct iwx_tx_data *txdata = &ring->data[idx];
@@ -18349,6 +20049,13 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 break;
                 
             case IWX_REPLY_RX_MPDU_CMD: {
+                /*
+                 * xe3: every MPDU record the firmware handed up, before any
+                 * driver-side filtering. Compared with sc_diag_rx_mgmt this
+                 * tells whether frames are lost in iwx_rx_frame() or never
+                 * arrived at all.
+                 */
+                ++sc->sc_diag_rx_mpdu;
                 // This notification's own payload length (checked above against the buffer), not the
                 // space left in the buffer: a firmware record can't then reach into the next one.
                 size_t maxlen = iwx_rx_packet_payload_len(pkt);
@@ -18496,7 +20203,33 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_CFG_CMD):
             case IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC):
             case IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_ABORT_UMAC):
+            /*
+             * MLD command group (MAC_CONF_GROUP 0x03) plus DATA_PATH SEC_KEY.
+             *
+             * These are plain "synchronous command ack" labels: the body below
+             * only copies a response payload when IWX_CMD_WANT_RESP was asked
+             * for (it is not - all five are sent with flags = 0, so
+             * sc_cmd_resp_pkt[idx] is NULL and the body breaks out of the
+             * switch), and then control reaches iwx_cmd_done() at the bottom of
+             * the loop, which is what wakes iwx_send_cmd().
+             *
+             * Without a label the ack lands in default: instead, `handled`
+             * becomes 0, iwx_cmd_done() is skipped and the caller sleeps the
+             * full second and returns EWOULDBLOCK - which looks exactly like a
+             * firmware that never answered. That is what v333 hit:
+             * xd10="id=0x308 e=35" while every group 0/1 command was
+             * acknowledged normally.
+             *
+             * OpenBSD carries all of these in the same switch
+             * (ob-if_iwx.c:11104-11119); they were dropped when the MLD path
+             * was ported here.
+             */
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SEC_KEY_CMD):
             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_SESSION_PROTECTION_CMD):
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MAC_CONFIG_CMD):
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_LINK_CONFIG_CMD):
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_STA_CONFIG_CMD):
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_STA_REMOVE_CMD):
             case IWX_REPLY_BEACON_FILTERING_CMD:
             case IWX_MAC_PM_POWER_TABLE:
             case IWX_TIME_QUOTA_CMD:
@@ -18506,6 +20239,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_MCC_UPDATE_CMD:
             case IWX_TIME_EVENT_CMD:
             case IWX_STATISTICS_CMD:
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD):
             case IWX_SCD_QUEUE_CFG: {
                 size_t pkt_len;
                 
@@ -18710,6 +20444,23 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 
             default:
                 handled = 0;
+                /*
+                 * Early warning for exactly the class of bug fixed in the case
+                 * block above: a reply arrived for a command slot still marked
+                 * CMD_PENDING, yet no case claimed its code. iwx_cmd_done() is
+                 * skipped below, so the waiter always times out even though the
+                 * firmware answered. Counted so a single boot can tell "the
+                 * firmware never answered" (u stays 0) from "the driver threw
+                 * the answer away" (u > 0, c = the first such wide id).
+                 */
+                if (qid == IWX_DQA_CMD_QUEUE && idx >= 0 &&
+                    idx < sc->txq[IWX_DQA_CMD_QUEUE].ring_count &&
+                    (sc->txq[IWX_DQA_CMD_QUEUE].data[idx].flags &
+                     IWX_TXDATA_FLAG_CMD_PENDING)) {
+                    if (sc->sc_diag_resp_unclaimed == 0)
+                        sc->sc_diag_resp_uc_code = (uint32_t)code;
+                    sc->sc_diag_resp_unclaimed++;
+                }
                 XYLog("%s: unhandled firmware response 0x%x/0x%x "
                       "rx ring %d[%d]\n",
                       DEVNAME(sc), code, pkt->len_n_flags,
@@ -18757,6 +20508,17 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
 void ItlIwx::
 iwx_rx_inc_wr_ptr(struct iwx_softc *sc, struct iwx_rx_ring *ring, uint32_t val)
 {
+    /*
+     * Diagnostic: the raw value handed to the firmware. Two callers use this
+     * (the ALIVE branch with a whole-ring value, and the tail of
+     * iwx_notif_intr() with (consumed - 1) & ~7), and they can disagree; only
+     * the last write matters. Not published here: this also runs from the
+     * interrupt context, where setProperty() is not allowed. iwx_publish_diag()
+     * copies it out.
+     */
+    sc->sc_diag_rx_wrptr_last = val;
+    sc->sc_diag_rx_wrptr_count++;
+
     if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
         /* Rx queue ids are offset by 512 in the shared HBUS write pointer. */
         IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR,
@@ -18785,7 +20547,7 @@ iwx_rx_restock_aligned(struct iwx_softc *sc, struct iwx_rx_ring *ring)
     uint32_t hw;
 
     if (ring->stat == NULL)
-        return IWX_RX_MQ_RING_COUNT;
+        return (uint32_t)(IWX_RX_MQ_RING_COUNT - 1) & ~7u;
 
     if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
         hw = le16toh(*(uint16_t *)(ring->stat)) & 0xfff;
@@ -18794,12 +20556,17 @@ iwx_rx_restock_aligned(struct iwx_softc *sc, struct iwx_rx_ring *ring)
     hw &= (IWX_RX_MQ_RING_COUNT - 1);
 
     /*
-     * A wrapped (or brand new) index of 0 means "nothing consumed yet", which
-     * for the free ring means the whole ring is available. Publishing 0 would
-     * tell the firmware there is no room at all.
+     * Never publish the ring size itself. The index space is 0..N-1
+     * (mcr_size = IWX_RX_QUEUE_CB_SIZE(512) = 9), so N aliases to 0 and
+     * advertises "no room" - exactly what this branch is trying to avoid.
+     *
+     * Use N-1 like Linux does: iwl_rxq_space() documents "up to
+     * (RX_QUEUE_SIZE - 1) free slots, to avoid ambiguity between empty and
+     * completely full queues" (pcie/rx.c:126-131) and the first restock
+     * publishes round_down(num_rx_bufs - 1, 8) = 504 for a 512-deep ring.
      */
     if (hw == 0)
-        hw = IWX_RX_MQ_RING_COUNT;
+        hw = IWX_RX_MQ_RING_COUNT - 1;
 
     return hw & ~7u;
 }
@@ -18845,6 +20612,10 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
     
 //    IWX_WRITE(&that->com, IWX_CSR_INT_MASK, 0);
     
+    /* Diagnostic only: interrupt context, so no setProperty() here. The value
+     * is copied to the IORegistry by the next iwx_publish_diag() call. */
+    sc->sc_diag_intr_count++;
+    
     if (sc->sc_flags & IWX_FLAG_USE_ICT) {
         uint32_t *ict = (uint32_t *)sc->ict_dma.vaddr;
         int tmp;
@@ -18874,8 +20645,26 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
         r1 = (0xff & r1) | ((0xff00 & r1) << 16);
     } else {
         r1 = IWX_READ(sc, IWX_CSR_INT);
-        if (r1 == 0xffffffff || (r1 & 0xfffffff0) == 0xa5a5a5a0)
-            goto out;
+        /* Record even a garbage read: "0xffffffff" is itself the evidence. */
+        sc->sc_diag_intr_last_raw = (uint32_t)r1;
+        if (r1 == 0xffffffff || (r1 & 0xfffffff0) == 0xa5a5a5a0) {
+            /*
+             * This used to be "goto out", which skips
+             * iwx_restore_interrupts() and therefore leaves CSR_INT_MASK at the
+             * 0 that intrFilter() wrote on entry. Unlike the SW_ERR and HW_ERR
+             * exits below, this branch schedules no reset (rv stays 0 and no
+             * init_task is queued), so one transient garbage read - a very
+             * plausible event while the MAC is being powered up - leaves the
+             * device permanently deaf and indistinguishable from "the firmware
+             * never sent ALIVE". Re-arm the mask: if the device really is gone,
+             * the write is dropped harmlessly.
+             *
+             * NB: Linux also leaves interrupts disabled here (iwl_pcie_irq_handler,
+             * pcie/rx.c "HARDWARE GONE??") but its watchdog resets the device
+             * afterwards; itlwm has no such watchdog on this path.
+             */
+            goto out_ena;
+        }
         r2 = IWX_READ(sc, IWX_CSR_FH_INT_STATUS);
     }
     if (r1 == 0 && r2 == 0) {
@@ -18935,7 +20724,16 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
         if ((sc->sc_flags & IWX_FLAG_SHUTDOWN) == 0)
             task_add(systq, &sc->init_task);
         rv = 1;
-        /* Re-arm on the way out; iwx_init_task reprograms the mask later. */
+        /*
+         * Re-arm the mask on the way out. The earlier comment here said the
+         * queued iwx_init_task would reprogram CSR_INT_MASK "on its own", but
+         * that runs on another thread and only after iwx_stop()/iwx_init();
+         * until then the register stays at the 0 intrFilter() wrote on entry,
+         * so every interrupt in the window is dropped and the device looks
+         * exactly like "the firmware never sent ALIVE" with intr-count frozen
+         * at 1. Re-arming cannot suppress the reset: init_task is already
+         * queued and iwx_stop() calls iwx_disable_interrupts() first.
+         */
         goto out_ena;
         
     }
@@ -18948,7 +20746,13 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
             task_add(systq, &sc->init_task);
         }
         rv = 1;
-        /* Same as SW_ERR: re-arm rather than leaving the mask at 0. */
+        /*
+         * Same reasoning as the SW_ERR branch above: re-arm and let
+         * iwx_stop() turn interrupts off deliberately. Linux calls
+         * iwl_disable_interrupts() explicitly on this path (pcie/rx.c:1988)
+         * and then has a watchdog to restart the device; itlwm has neither,
+         * so leaving the mask at 0 only hides whatever the hardware says next.
+         */
         goto out_ena;
     }
     
@@ -19005,6 +20809,9 @@ iwx_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count)
     struct iwx_softc *sc = &that->com;
     uint32_t inta_fh, inta_hw;
     int vector = 0;
+    
+    /* Diagnostic only: see iwx_intr(); setProperty() is not allowed here. */
+    sc->sc_diag_intr_count++;
     
     inta_fh = IWX_READ(sc, IWX_CSR_MSIX_FH_INT_CAUSES_AD);
     inta_hw = IWX_READ(sc, IWX_CSR_MSIX_HW_INT_CAUSES_AD);
@@ -20482,11 +22289,108 @@ iwx_init_diag(struct iwx_softc *sc)
     sc->sc_diag_prph_scratch_size = 0;
     sc->sc_diag_sect_len_total = 0;
     sc->sc_diag_alive_wait_loops = -1;
+    sc->sc_diag_intr_count = 0;
+    sc->sc_diag_intr_last_raw = 0;
+    sc->sc_diag_int_mask = 0;
+    sc->sc_diag_int_mask_want = 0;
+    sc->sc_diag_int_mask_rb = 0;
+    sc->sc_diag_int_mask_tag = "none";
+    sc->sc_diag_rxq_hw_kick = 0;
+    sc->sc_diag_prph_boot_stage = 0;
+    sc->sc_diag_prph_ipc = 0;
+    sc->sc_diag_prph_sleep = 0;
+    sc->sc_diag_rxq_hw = 0;
+    sc->sc_diag_rx_wrptr_last = 0xffffffff;   /* never published */
+    sc->sc_diag_rx_wrptr_count = 0;
+    sc->sc_diag_rxq_cur = -1;
+    sc->sc_diag_fcs_trimmed = 0;
+    sc->sc_diag_fcs_last = -1;
+    sc->sc_diag_fh_int_status = 0;
+    sc->sc_diag_hw_if_config = 0;
+    sc->sc_diag_secboot_cpu1 = 0;
+    sc->sc_diag_secboot_cpu2 = 0;
+    sc->sc_diag_umac_pc = 0;
+    sc->sc_diag_lmac_pc = 0;
+    sc->sc_diag_msix_mode = 0;
     sc->sc_diag_pnvm = "not-reached";
     sc->sc_diag_alive = -1;
     sc->sc_diag_init = "not-reached";
     sc->sc_diag_hw_rev = -1;
     sc->sc_diag_rf_id = -1;
+    /* 0x7fffffff = the command was never issued. */
+    sc->sc_diag_init_cmd_err = 0x7fffffff;
+    sc->sc_diag_init_bits_before = -1;   /* -1 = the wait was never reached */
+    sc->sc_diag_init_wait_err = 0x7fffffff;
+    sc->sc_diag_pnvm_size = 0;
+    sc->sc_diag_pnvm_addr_ok = -1;       /* -1 = never sampled */
+    sc->sc_diag_pnvm_wait_err = 0x7fffffff;
+    sc->sc_diag_pnvm_layout = 0;         /* 0 never reached, 1 flat, 2 fragmented */
+    sc->sc_diag_pnvm_segs = 0;
+    sc->sc_diag_nvm_err = 0x7fffffff;    /* never ran */
+    sc->sc_diag_nvm_actual_len = -1;
+    sc->sc_diag_nvm_expect_len = -1;
+    sc->sc_diag_nvm_v4 = -1;
+    sc->sc_diag_nvm_mac = 0xffffff;      /* n/a */
+    sc->sc_diag_dram_int_tbl = 0xffffffff;
+    sc->sc_diag_ict_reset_called = 0;
+    sc->sc_diag_ict_sum = 0;
+    sc->sc_diag_ict_cur_snapshot = -1;
+    sc->sc_diag_ict_tbl_words = 0;
+    sc->sc_diag_msix_fh_causes = 0xffffffff;
+    sc->sc_diag_msix_hw_causes = 0xffffffff;
+    sc->sc_diag_msix_automask = 0xffffffff;
+    sc->sc_diag_rxq_hw_after = 0xffffffff;
+    sc->sc_diag_rxq_cur_after = 0xffffffff;
+    /* RX accounting; zero is a real value for all four. */
+    sc->sc_diag_rx_mpdu = 0;
+    sc->sc_diag_rx_mgmt = 0;
+    sc->sc_diag_rx_beacon = 0;
+    sc->sc_diag_rx_proberesp = 0;
+    sc->sc_diag_scan_nodes = 0;
+    sc->sc_diag_scan_essid = 0;
+    sc->sc_diag_nvm_cmd_err = 0x7fffffff;
+    sc->sc_diag_phy_cfg_err = 0x7fffffff;
+    /* Scan bring-up; see the field comments in if_iwxvar.h. */
+    sc->sc_diag_init_calls = 0;
+    sc->sc_diag_init_err = 0x7fffffff;   /* iwx_init() never called */
+    sc->sc_diag_scan_ver = -1;
+    sc->sc_diag_scan_reqlen = -1;
+    sc->sc_diag_scan_capa = -1;
+    sc->sc_diag_scan_send_err = 0x7fffffff;  /* never reached */
+    sc->sc_diag_scan_send_ms = -1;       /* never sampled */
+    /* First failed firmware command; see if_iwxvar.h. */
+    sc->sc_diag_cmd_id = -1;
+    sc->sc_diag_cmd_err = 0x7fffffff;    /* no command has failed yet */
+    /* Every failed command id, in arrival order (xd13). */
+    sc->sc_diag_cmd_fail[0] = -1;
+    sc->sc_diag_cmd_fail[1] = -1;
+    sc->sc_diag_cmd_fail[2] = -1;
+    sc->sc_diag_cmd_fail[3] = -1;
+    sc->sc_diag_cmd_fail_n = 0;
+    /* PHY_CONTEXT_CMD version from TLV 48; 0xff = not looked up yet (xd14). */
+    sc->sc_diag_phy_ctxt_ver = IWX_FW_CMD_VER_UNKNOWN;
+    /* Scan bring-up chain counters; see if_iwxvar.h. */
+    sc->sc_diag_begin_scan_done = 0;
+    sc->sc_diag_newstate_calls = 0;
+    sc->sc_diag_newstate_last = -1;
+    sc->sc_diag_newstate_bodies = 0;
+    sc->sc_diag_scan_calls = 0;
+    sc->sc_diag_scan_err = 0x7fffffff;   /* iwx_scan() has never failed */
+    sc->sc_diag_aux_sta_skipped = 0;
+    /*
+     * MLD (MAC_CONF_GROUP) bookkeeping. The gate is re-derived from the
+     * firmware capability TLV in iwx_read_firmware(), so it starts clear here;
+     * the five errnos stay at 0x7fffffff until their command is actually sent.
+     */
+    sc->sc_use_mld_api = 0;
+    sc->sc_diag_mld_mac_err = 0x7fffffff;
+    sc->sc_diag_mld_link_err = 0x7fffffff;
+    sc->sc_diag_mld_sta_err = 0x7fffffff;
+    sc->sc_diag_mld_key_err = 0x7fffffff;
+    sc->sc_diag_mld_rm_err = 0x7fffffff;
+    /* Replies discarded because no case claimed their code; see xo. */
+    sc->sc_diag_resp_unclaimed = 0;
+    sc->sc_diag_resp_uc_code = 0xffffffff;
 }
 
 void ItlIwx::
@@ -20538,9 +22442,54 @@ iwx_publish_diag(struct iwx_softc *sc)
     device->setProperty("xe3-iwx-ctxt-boot-ctrl", sc->sc_diag_ctxt_boot_ctrl, 32);
     device->setProperty("xe3-iwx-prph-scratch-size", sc->sc_diag_prph_scratch_size, 32);
     device->setProperty("xe3-iwx-alive-loops", sc->sc_diag_alive_wait_loops, 32);
+    device->setProperty("xe3-iwx-intr-count", sc->sc_diag_intr_count, 32);
+    device->setProperty("xe3-iwx-intr-last-raw", sc->sc_diag_intr_last_raw, 32);
+    device->setProperty("xe3-iwx-int-mask", sc->sc_diag_int_mask, 32);
+    device->setProperty("xe3-iwx-im-want", sc->sc_diag_int_mask_want, 32);
+    device->setProperty("xe3-iwx-im-rb", sc->sc_diag_int_mask_rb, 32);
+    iwx_set_diag_string(device, "xe3-iwx-im-tag", sc->sc_diag_int_mask_tag);
+    device->setProperty("xe3-iwx-rxq-hw0", sc->sc_diag_rxq_hw_kick, 32);
+    device->setProperty("xe3-iwx-prph-boot-stage", sc->sc_diag_prph_boot_stage, 32);
+    device->setProperty("xe3-iwx-prph-ipc", sc->sc_diag_prph_ipc, 32);
+    device->setProperty("xe3-iwx-prph-sleep", sc->sc_diag_prph_sleep, 32);
+    device->setProperty("xe3-iwx-rxq-hw", sc->sc_diag_rxq_hw, 32);
+    device->setProperty("xe3-iwx-rx-wrptr-last", sc->sc_diag_rx_wrptr_last, 32);
+    device->setProperty("xe3-iwx-rx-wrptr-n", sc->sc_diag_rx_wrptr_count, 32);
+    device->setProperty("xe3-iwx-rxq-cur", sc->sc_diag_rxq_cur, 32);
+    device->setProperty("xe3-iwx-fh-int-status", sc->sc_diag_fh_int_status, 32);
+    device->setProperty("xe3-iwx-hw-if-config", sc->sc_diag_hw_if_config, 32);
+    device->setProperty("xe3-iwx-secboot-cpu1", sc->sc_diag_secboot_cpu1, 32);
+    device->setProperty("xe3-iwx-secboot-cpu2", sc->sc_diag_secboot_cpu2, 32);
+    device->setProperty("xe3-iwx-umac-pc", sc->sc_diag_umac_pc, 32);
+    device->setProperty("xe3-iwx-lmac-pc", sc->sc_diag_lmac_pc, 32);
+    device->setProperty("xe3-iwx-msix-mode", sc->sc_diag_msix_mode, 32);
     iwx_set_diag_string(device, "xe3-iwx-pnvm", sc->sc_diag_pnvm);
     device->setProperty("xe3-iwx-alive", sc->sc_diag_alive, 32);
     iwx_set_diag_string(device, "xe3-iwx-init", sc->sc_diag_init);
+    device->setProperty("xe3-iwx-init-cmd-err", sc->sc_diag_init_cmd_err, 32);
+    device->setProperty("xe3-iwx-nvm-cmd-err", sc->sc_diag_nvm_cmd_err, 32);
+    device->setProperty("xe3-iwx-phy-cfg-err", sc->sc_diag_phy_cfg_err, 32);
+    device->setProperty("xe3-iwx-init-bits", sc->sc_diag_init_bits_before, 32);
+    device->setProperty("xe3-iwx-init-wait-err", sc->sc_diag_init_wait_err, 32);
+    device->setProperty("xe3-iwx-pnvm-size", sc->sc_diag_pnvm_size, 32);
+    device->setProperty("xe3-iwx-pnvm-addr-ok", sc->sc_diag_pnvm_addr_ok, 32);
+    device->setProperty("xe3-iwx-msix-fh-causes", sc->sc_diag_msix_fh_causes, 32);
+    device->setProperty("xe3-iwx-msix-hw-causes", sc->sc_diag_msix_hw_causes, 32);
+    device->setProperty("xe3-iwx-msix-automask", sc->sc_diag_msix_automask, 32);
+    device->setProperty("xe3-iwx-dram-int-tbl", sc->sc_diag_dram_int_tbl, 32);
+    device->setProperty("xe3-iwx-ict-reset-called", sc->sc_diag_ict_reset_called, 32);
+    device->setProperty("xe3-iwx-ict-sum", sc->sc_diag_ict_sum, 32);
+    device->setProperty("xe3-iwx-ict-cur", sc->sc_diag_ict_cur_snapshot, 32);
+    device->setProperty("xe3-iwx-ict-words", sc->sc_diag_ict_tbl_words, 32);
+    device->setProperty("xe3-iwx-rxq-hw-after", sc->sc_diag_rxq_hw_after, 32);
+    device->setProperty("xe3-iwx-rxq-cur-after", sc->sc_diag_rxq_cur_after, 32);
+    device->setProperty("xe3-iwx-rx-mpdu", sc->sc_diag_rx_mpdu, 32);
+    device->setProperty("xe3-iwx-rx-mgmt", sc->sc_diag_rx_mgmt, 32);
+    device->setProperty("xe3-iwx-rx-beacon", sc->sc_diag_rx_beacon, 32);
+    device->setProperty("xe3-iwx-rx-proberesp", sc->sc_diag_rx_proberesp, 32);
+    device->setProperty("xe3-iwx-scan-evt", sc->sc_ic.ic_diag_beacon_evt, 32);
+    device->setProperty("xe3-iwx-resp-unclaimed", sc->sc_diag_resp_unclaimed, 32);
+    device->setProperty("xe3-iwx-resp-unclaimed-code", sc->sc_diag_resp_uc_code, 32);
 
     /*
      * Short-name rollups.
@@ -20560,6 +22509,10 @@ iwx_publish_diag(struct iwx_softc *sc)
      *         fh-int-status
      *   xd2 = "g=0x... b=0 p=0 t=load-init-fw c=53209,2819"
      *         gp-cntrl / prph-boot-stage / prph-ipc / stage / secboot cpu1,2
+     *   xm  = "t=fwload w=0x80000001 r=0x1 x=0 h=0"
+     *         int-mask tag / written value / readback / rxq-hw baseline /
+     *         rxq-hw now. This is the one line that decides whether the
+     *         hardware accepted CSR_INT_BIT_FH_RX.
      */
     {
         char line[192];
@@ -20573,6 +22526,155 @@ iwx_publish_diag(struct iwx_softc *sc)
                  sc->sc_diag_rxq_cur,
                  (unsigned)sc->sc_diag_fh_int_status);
         iwx_set_diag_string(device, "xd", line);
+        /*
+         * xd4 = "w=<last RX wr_ptr published> n=<how many times>".
+         * w=0 with n>0 means the driver told the firmware "zero free RBDs",
+         * which is the prime suspect for the missing INIT_EXTENDED_CFG ack.
+         */
+        snprintf(line, sizeof(line), "w=%u n=%u",
+                 (unsigned)sc->sc_diag_rx_wrptr_last,
+                 (unsigned)sc->sc_diag_rx_wrptr_count);
+        iwx_set_diag_string(device, "xd4", line);
+        /*
+         * xg / xh / xi = where do the scan results die?
+         *
+         *   xg = "m=<mpdu records> g=<mgmt into net80211> b=<beacons> p=<probe
+         *         responses> e=<reached ieee80211_add_scan>"
+         *   xh = "bc=badchan cm=chanmismatch md=mgtdiscard ts=tooshort
+         *         el=elem_toosmall na=nodealloc"
+         *   xi = "sm=ssidmismatch wb=wrongbss ua=unauth bs=badsubtype
+         *         sa=active scans sp=passive scans"
+         *
+         * m >> g        frames dropped inside iwx_rx_frame()
+         * g >> b+p      firmware delivers traffic but no foreign beacons
+         * b+p >> e      net80211 rejected them; xh says why
+         * e >> results  the results never left the driver
+         */
+        snprintf(line, sizeof(line), "m=%u g=%u b=%u p=%u e=%u",
+                 (unsigned)sc->sc_diag_rx_mpdu,
+                 (unsigned)sc->sc_diag_rx_mgmt,
+                 (unsigned)sc->sc_diag_rx_beacon,
+                 (unsigned)sc->sc_diag_rx_proberesp,
+                 (unsigned)sc->sc_ic.ic_diag_beacon_evt);
+        iwx_set_diag_string(device, "xg", line);
+        snprintf(line, sizeof(line), "bc=%u cm=%u md=%u ts=%u el=%u na=%u",
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_badchan,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_chanmismatch,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_mgtdiscard,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_tooshort,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_elem_toosmall,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_nodealloc);
+        iwx_set_diag_string(device, "xh", line);
+        snprintf(line, sizeof(line), "sm=%u wb=%u ua=%u bs=%u sa=%u sp=%u",
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_ssidmismatch,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_wrongbss,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_unauth,
+                 (unsigned)sc->sc_ic.ic_stats.is_rx_badsubtype,
+                 (unsigned)sc->sc_ic.ic_stats.is_scan_active,
+                 (unsigned)sc->sc_ic.ic_stats.is_scan_passive);
+        iwx_set_diag_string(device, "xi", line);
+        /*
+         * xsc = node table at the end of the last completed scan:
+         *   n = every node net80211 holds, e = how many carry an SSID.
+         * Published by the next scan's iwx_umac_scan_v17(), so both numbers
+         * describe the same finished scan.
+         */
+        snprintf(line, sizeof(line), "n=%d e=%d",
+                 sc->sc_diag_scan_nodes, sc->sc_diag_scan_essid);
+        iwx_set_diag_string(device, "xsc", line);
+        /*
+         * xv / xv2 / xv3 = where macOS scan requests and the resulting beacons
+         * die between IO80211/WCL and the driver. net80211's own counters
+         * (xg/xh) already prove the frames arrive; these three lines cover the
+         * segment on our side of that boundary.
+         *
+         * NOTE: setSCAN_REQ() on the legacy apple80211 interface is a dead
+         * path on this stack - the live entry is
+         * setWCL_SCAN_REQ() -> wclCommand case 0 -> beginWCLScan().
+         *
+         *   xv  = "req=<beginWCLScan entries> re=<request reused a running
+         *          S_SCAN instead of restarting it> busy=<kIOReturnBusy>
+         *          unsup=<kIOReturnUnsupported> nr=<kIOReturnNotReady>
+         *          ch=<last request's channelCount>"
+         *   xv2 = "fin=<finishWCLScan with a request pending> ab=<...Aborted>
+         *          to=<...Timeout> pu=<ScanResult posted> pn=<posted while
+         *          scanPending was already false> sk=<scanSkipCompletion hits>"
+         *   xv3 = "ie=<validIEs rejected> i4=<accepted once the 4 trailing FCS
+         *          bytes are dropped> ss=<esslen>32> nc=<ni_chan unusable>
+         *          ch=<channel 0 or >196> md=<IOMalloc failed>
+         *          cs=<last channelSpec handed to IO80211>"
+         *
+         * Reading: re >> req means macOS keeps asking for channels while the
+         * driver is already scanning and every such request is served by
+         * whatever is left of the running scan. pu >> (Scan Add lines in
+         * dmesg) means IO80211 drops the message, not us. pn > 0 means we
+         * published after our own request had already finished. ie >> i4 means
+         * the frames are intact and only the trailing FCS breaks the strict IE
+         * validator; ie == i4 means the frames really are malformed.
+         */
+        snprintf(line, sizeof(line), "req=%u re=%u busy=%u unsup=%u nr=%u ch=%u",
+                 (unsigned)sc->sc_ic.ic_diag_wcl_req,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_reuse,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_busy,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_unsup,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_notready,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_req_chans);
+        iwx_set_diag_string(device, "xv", line);
+        snprintf(line, sizeof(line), "fin=%u ab=%u to=%u pu=%u pn=%u sk=%u",
+                 (unsigned)sc->sc_ic.ic_diag_wcl_fin,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_abort,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_timeout,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_post,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_pub_nopend,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_skip);
+        iwx_set_diag_string(device, "xv2", line);
+        /*
+         * xj = "req=<beginWCLJoin calls> busy=<refused: joinPending or
+         *       ifnet not RUNNING> unsup=<unsupported auth> ab=<pending
+         *       WCL scan torn down to let the join through>
+         *       g14=<commands retargeted to group 14>"
+         *
+         * Reading: req > 0 with ab > 0 means the anti-starvation path
+         * fired. g14 == 0 on a Bz/SC boot means the CMD_VERSIONS lookup
+         * never selected group 14, i.e. MAC_CONTEXT is still going out in
+         * group 1 and xd10 will keep naming 0x128 with e=35.
+         */
+        snprintf(line, sizeof(line), "req=%u busy=%u unsup=%u ab=%u g14=%u",
+                 (unsigned)sc->sc_ic.ic_diag_wcl_join_req,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_join_busy,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_join_unsup,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_join_aborted,
+                 (unsigned)sc->sc_diag_cmd_g14);
+        iwx_set_diag_string(device, "xj", line);
+        snprintf(line, sizeof(line), "ie=%u i4=%u ss=%u nc=%u ch=%u md=%u cs=0x%x",
+                 (unsigned)sc->sc_ic.ic_diag_wcl_ies,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_ies4,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_ssid,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_nochan,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_badchan,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_nomem,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_chspec);
+        iwx_set_diag_string(device, "xv3", line);
+        /*
+         * xv4 = the FCS trim added in v331 (the only behaviour change).
+         *   mc : bytes stripped last time (-1 = never, expected 4)
+         *   tr : total strips (expected roughly one per received frame)
+         *   i4 : beacons that would pass validIEs() with 4 trailing bytes
+         *        dropped (cross-check; empty once mc=4 is real)
+         */
+        snprintf(line, sizeof(line), "mc=%d tr=%u i4=%u",
+                 sc->sc_diag_fcs_last,
+                 (unsigned)sc->sc_diag_fcs_trimmed,
+                 (unsigned)sc->sc_ic.ic_diag_wcl_ies4);
+        iwx_set_diag_string(device, "xv4", line);
+        snprintf(line, sizeof(line),
+                 "t=%s w=0x%x r=0x%x x=%u h=%u",
+                 sc->sc_diag_int_mask_tag != NULL ? sc->sc_diag_int_mask_tag : "?",
+                 (unsigned)sc->sc_diag_int_mask_want,
+                 (unsigned)sc->sc_diag_int_mask_rb,
+                 (unsigned)sc->sc_diag_rxq_hw_kick,
+                 (unsigned)sc->sc_diag_rxq_hw);
+        iwx_set_diag_string(device, "xm", line);
         snprintf(line, sizeof(line),
                  "g=0x%x b=%u p=%u t=%s c=%u,%u",
                  (unsigned)sc->sc_diag_gp_cntrl,
@@ -20582,6 +22684,286 @@ iwx_publish_diag(struct iwx_softc *sc)
                  (unsigned)sc->sc_diag_secboot_cpu1,
                  (unsigned)sc->sc_diag_secboot_cpu2);
         iwx_set_diag_string(device, "xd2", line);
+        /*
+         * xd3 = the numbers that survive iwx_run_init_mvm_ucode()'s bare
+         * `return err` paths. 2147483647 = never reached.
+         *   i : INIT_EXTENDED_CFG errno
+         *   n : NVM_ACCESS_COMPLETE errno
+         *   b : sc_init_complete sampled right BEFORE the INIT_COMPLETE wait;
+         *       bit0 (INIT_COMPLETE) set means the notification had already
+         *       arrived, bit2 (0x04) set means PNVM_INIT_COMPLETE did
+         *   w : that wait's errno (0 ok, 35 timeout)
+         *   p : prph_scratch.ctrl_cfg.pnvm_cfg.pnvm_size as the firmware sees
+         *       it - this is the only channel that tells the firmware where
+         *       the PNVM payload lives, so p=0 with b having bit2 set means
+         *       "doorbell acknowledged, but nothing to load"
+         *   q : 1 if pnvm_base_addr was non-zero, -1 if never sampled
+         *   v : PNVM_INIT_COMPLETE wait errno inside iwx_load_pnvm()
+         *       (0 ok, 35 timeout, 0x7fffffff never reached). This one is
+         *       sampled right after the wait, so unlike i/n/b/w it stays valid
+         *       even when that wait aborted the whole init sequence.
+         *   l : DRAM layout handed to the firmware (0 not reached, 1 flat,
+         *       2 fragmented) - p alone cannot tell these apart because both
+         *       layouts report the same pnvm_size
+         *   g : number of payload sections published
+         */
+        snprintf(line, sizeof(line),
+                 "i=%d n=%d b=%d w=%d p=%u q=%d v=%d l=%d g=%d",
+                 sc->sc_diag_init_cmd_err,
+                 sc->sc_diag_nvm_cmd_err,
+                 sc->sc_diag_init_bits_before,
+                 sc->sc_diag_init_wait_err,
+                 (unsigned)sc->sc_diag_pnvm_size,
+                 sc->sc_diag_pnvm_addr_ok,
+                 sc->sc_diag_pnvm_wait_err,
+                 sc->sc_diag_pnvm_layout,
+                 sc->sc_diag_pnvm_segs);
+        iwx_set_diag_string(device, "xd3", line);
+        /*
+         * xd5 = state right after the INIT_EXTENDED_CFG timeout.
+         * fh/hw/am are the MSI-X cause registers the handler actually reads
+         * (non-zero => firmware raised something, the vector just did not
+         * reach us). hw2 = RX hardware index re-read at that moment; if it
+         * grew past xm's h= the firmware kept feeding the ring and the ack
+         * loss is elsewhere.
+         */
+        snprintf(line, sizeof(line),
+                 "fh=0x%x hw=0x%x am=0x%x h2=%u c2=%u",
+                 (unsigned)sc->sc_diag_msix_fh_causes,
+                 (unsigned)sc->sc_diag_msix_hw_causes,
+                 (unsigned)sc->sc_diag_msix_automask,
+                 (unsigned)sc->sc_diag_rxq_hw_after,
+                 (unsigned)sc->sc_diag_rxq_cur_after);
+        iwx_set_diag_string(device, "xd5", line);
+        /*
+         * xd6 = CSR_DRAM_INT_TBL_REG read back after ALIVE, plus how many
+         * times iwx_ict_reset() ran. ict still bit31-set on msix=1 means the
+         * device was told to use the DRAM interrupt table, which Linux never
+         * does on MSI-X.
+         */
+        /*
+         * xd6 decides the ICT hypothesis in one boot:
+         *   tbl bit31 = CSR_DRAM_INT_TBL_ENABLE as the hardware reports it
+         *   n         = how many times iwx_ict_reset() ran (0 => gate held)
+         *   ict       = OR of every dword in the ICT DRAM table; iwx_ict_reset
+         *               zeroed it, so non-zero is firmware-written
+         *   icur      = ict_cur, the driver's ICT read index
+         *   w         = table size in dwords (sanity: 1024)
+         */
+        snprintf(line, sizeof(line),
+                 "tbl=0x%x n=%d ict=0x%x icur=%d w=%d m=%d",
+                 (unsigned)sc->sc_diag_dram_int_tbl,
+                 sc->sc_diag_ict_reset_called,
+                 (unsigned)sc->sc_diag_ict_sum,
+                 sc->sc_diag_ict_cur_snapshot,
+                 sc->sc_diag_ict_tbl_words,
+                 sc->sc_diag_msix_mode);
+        iwx_set_diag_string(device, "xd6", line);
+        /*
+         * xd7 = why iwx_nvm_get() failed, which used to be invisible.
+         *
+         * On the first v320 boot everything through INIT_COMPLETE succeeded
+         * (xd3 showed i=0 n=0 w=0 v=0 l=2 g=2) but attach still ended at
+         * stage="alive-ok" with error="none", because the failing call was
+         * iwx_nvm_get() at ItlIwx.cpp:6142 and its three failure paths left
+         * no trace beyond xe3-iwx-init="nvm-failed".
+         *
+         *   e = errno iwx_nvm_get() returned (0x7fffffff = never ran)
+         *   a = actual payload length of the NVM_GET_INFO response (-1 = no packet)
+         *   x = payload length the driver expected
+         *   v = 1 if the v4 response layout was assumed (API bit 48 absent
+         *       => 0, because the SC image ships no API_CHANGES_SET TLV)
+         *   m = first three bytes of the decoded MAC (0xffffff = n/a)
+         *   b = MAC CSR base actually used (0x30 for SC, 0x380 for AX210-)
+         */
+        snprintf(line, sizeof(line),
+                 "e=%d a=%d x=%d v=%d m=0x%x b=0x%x",
+                 sc->sc_diag_nvm_err,
+                 sc->sc_diag_nvm_actual_len,
+                 sc->sc_diag_nvm_expect_len,
+                 sc->sc_diag_nvm_v4,
+                 (unsigned)sc->sc_diag_nvm_mac,
+                 (unsigned)sc->sc_mac_addr_from_csr);
+        iwx_set_diag_string(device, "xd7", line);
+        /*
+         * xd8 = the channel bookkeeping that decides whether any scan can
+         * ever run. Filled in after iwx_nvm_get() recomputes the bitmap.
+         *
+         *   st  = ic_state (0 INIT, 1 SCAN, 2 AUTH, 3 ASSOC, 4 RUN)
+         *   ch  = channels with a frequency (what iwx_init_channel_map filled)
+         *   act = bits set in ic_chan_active (what CHANNELS_INFO iterates)
+         *   av  = bits set in ic_chan_avail (what ieee80211_channel_init set)
+         *   1/36= ic_flags of channel 1 / 36
+         *   q1  = ic_freq of channel 1
+         *
+         * ch > 0 but act == 0 is the failure this build fixes: the NVM
+         * channel map exists but the active bitmap was never recomputed,
+         * so IO80211 sees zero supported channels and halts the scan manager.
+         */
+        {
+            struct ieee80211com *ic = &sc->sc_ic;
+            int i, ch = 0, act = 0, av = 0;
+
+            for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
+                if (ic->ic_channels[i].ic_freq != 0)
+                    ch++;
+                if (isset(ic->ic_chan_active, i))
+                    act++;
+                if (isset(ic->ic_chan_avail, i))
+                    av++;
+            }
+            snprintf(line, sizeof(line),
+                     "st=%d ch=%d act=%d av=%d 1=%x 36=%x q1=%u",
+                     (int)ic->ic_state, ch, act, av,
+                     (unsigned)ic->ic_channels[1].ic_flags,
+                     (unsigned)ic->ic_channels[36].ic_flags,
+                     (unsigned)ic->ic_channels[1].ic_freq);
+            iwx_set_diag_string(device, "xd8", line);
+        }
+        /*
+         * xd9 = why the FIRST scan never started, which is what keeps
+         * isDriverAvailable at 0 and the IO80211 scan manager in HALTED.
+         *
+         *   n  = times iwx_init() was entered
+         *   ie = its return code (35 EWOULDBLOCK = ic_state never reached
+         *        S_SCAN within 1 s -> iwx_stop() -> no DRIVER_READY event;
+         *        0 = success; 0x7fffffff = never called)
+         *   sv = iwx_lookup_cmd_ver(LONG_GROUP, SCAN_REQ_UMAC)
+         *   sl = payload length from iwx_umac_scan_size (-1 = not computed)
+         *   nc = sc_capa_n_scan_channels
+         *   se = errno of the failing step inside iwx_umac_scan():
+         *        positive = iwx_send_cmd() result, -ERANGE = size check,
+         *        -EIO = probe request build, 0x7fffffff = never reached
+         *
+         * iwx_scan() only assigns ic->ic_state = S_SCAN (ItlIwx.cpp:15027)
+         * when iwx_umac_scan() returns 0, so se is the single number that
+         * decides whether the failure is in the firmware command or earlier.
+         */
+        snprintf(line, sizeof(line), "n=%d ie=%d sv=%d sl=%d nc=%d se=%d",
+                 sc->sc_diag_init_calls, sc->sc_diag_init_err,
+                 sc->sc_diag_scan_ver, sc->sc_diag_scan_reqlen,
+                 sc->sc_diag_scan_capa, sc->sc_diag_scan_send_err);
+        iwx_set_diag_string(device, "xd9", line);
+        /*
+         * xe3-iwx-scan-ms = how long the SCAN_REQ_UMAC v17 send took, in ms
+         * (-1 = the v17 path never ran). It is sampled inside
+         * iwx_umac_scan_v17() right after iwx_send_cmd() returns, which is
+         * later than xd9's se, so the pair (errno, elapsed) is what actually
+         * quantifies the ack: 0 with a few ms = answered, 35 with ~1000 ms =
+         * the 1 s command sleep expired.
+         */
+        device->setProperty("xe3-iwx-scan-ms", sc->sc_diag_scan_send_ms, 32);
+        /*
+         * xd10 = the first firmware command that failed (id + errno).
+         *
+         * xd9's ie=35 is ambiguous: 35 is EWOULDBLOCK both when the 1 s S_SCAN
+         * wait expires and when any command sleep in iwx_init_hw() times out.
+         * This names the command, so one boot tells which stage really broke.
+         *
+         *   id = hcmd->id (-1 = no command has failed)
+         *   e  = its errno (0x7fffffff = no command has failed)
+         */
+        snprintf(line, sizeof(line), "id=0x%x e=%d",
+                 (unsigned)sc->sc_diag_cmd_id, sc->sc_diag_cmd_err);
+        iwx_set_diag_string(device, "xd10", line);
+        /*
+         * xd11 = scan bring-up chain counters.
+         *
+         * xd9's ie=35 + sv/sl/nc=-1 says iwx_init() gave up before
+         * iwx_umac_scan(), but three different links can cause that. These
+         * counters name the first missing one:
+         *
+         *   bs=0                 -> ieee80211_begin_scan() never returned,
+         *                           i.e. iwx_init_hw() failed (xd10 has the id)
+         *   bs=1 ns=0            -> begin_scan() did not reach
+         *                           ieee80211_new_state(S_SCAN)
+         *   bs=1 ns>0 nl!=1      -> a state other than S_SCAN was requested
+         *   bs=1 ns>0 nl=1 nt=0   -> newstate task queued but never ran
+         *                           (gate starvation: iwx_init() is sleeping
+         *                           in the gate waiting for it)
+         *   nt>0 sc=0            -> iwx_newstate_task() returned before
+         *                           iwx_scan() (SHUTDOWN / SCANNING / generation)
+         *   sc>0 se!=0x7fffffff  -> iwx_scan() ran and failed
+         */
+        snprintf(line, sizeof(line), "bs=%d ns=%d nl=%d nt=%d sc=%d se=%d",
+                 sc->sc_diag_begin_scan_done, sc->sc_diag_newstate_calls,
+                 sc->sc_diag_newstate_last, sc->sc_diag_newstate_bodies,
+                 sc->sc_diag_scan_calls, sc->sc_diag_scan_err);
+        iwx_set_diag_string(device, "xd11", line);
+        /*
+         * xd12 = aux station gate.
+         *
+         *   aux=1 -> iwx_add_aux_sta() was skipped (SC family gate)
+         *   aux=0 -> the legacy ADD_STA was still sent
+         */
+        snprintf(line, sizeof(line), "aux=%d", sc->sc_diag_aux_sta_skipped);
+        iwx_set_diag_string(device, "xd12", line);
+        /*
+         * xd13 = every command that failed during this init attempt.
+         *
+         * iwx_init_hw() no longer aborts on the first failure, so one boot
+         * names all mismatched commands (0xffffffff = unused slot). xd10 still
+         * carries the first one, which keeps old readings comparable.
+         */
+        {
+            int k, f[4];
+            for (k = 0; k < 4; k++)
+                f[k] = (k < sc->sc_diag_cmd_fail_n) ?
+                    sc->sc_diag_cmd_fail[k] : -1;
+            snprintf(line, sizeof(line), "f=0x%x,0x%x,0x%x,0x%x",
+                     f[0], f[1], f[2], f[3]);
+            iwx_set_diag_string(device, "xd13", line);
+        }
+        /*
+         * xd14 = PHY_CONTEXT_CMD version vs. parsed command-version entries.
+         *
+         *   phyv=4      -> TLV 48 really declares 4 (the "== 3" gate was wrong)
+         *   phyv=3      -> older table, the v1 fallback would have been right
+         *   phyv=255    -> table not parsed, every lookup is UNKNOWN
+         *   ncv=229     -> how many entries TLV 48 actually carried
+         * Those are different bugs with different fixes, so keep them apart.
+         */
+        snprintf(line, sizeof(line), "phyv=%d ncv=%d",
+                 sc->sc_diag_phy_ctxt_ver, sc->n_cmd_versions);
+        iwx_set_diag_string(device, "xd14", line);
+        /*
+         * xmld = MLD (MAC_CONF_GROUP 0x03) step errnos, the replacement for
+         * the six legacy commands that sc_use_mld_api bypasses.
+         *
+         *   md = MAC_CONFIG_CMD      lk = LINK_CONFIG_CMD
+         *   st = STA_CONFIG_CMD      ky = SEC_KEY_CMD
+         *   rm = STA_REMOVE_CMD
+         *
+         * 0x7fffffff = that step was never issued, 0 = acknowledged, anything
+         * else is the errno. Reading: md=35 means group 3 is rejected too and
+         * the whole approach has to change; md=0 lk=35 is a payload/version
+         * problem in LINK_CONFIG; md=0 lk=0 st=35 is the same for STA_CONFIG.
+         * xe3-iwx-mld-api tells whether the gate was hit at all - 0 there
+         * means the boot never parsed the capability and these fields are all
+         * still at their initial value.
+         */
+        snprintf(line, sizeof(line), "md=%d lk=%d st=%d ky=%d rm=%d",
+                 sc->sc_diag_mld_mac_err, sc->sc_diag_mld_link_err,
+                 sc->sc_diag_mld_sta_err, sc->sc_diag_mld_key_err,
+                 sc->sc_diag_mld_rm_err);
+        iwx_set_diag_string(device, "xmld", line);
+        /*
+         * xo = replies thrown away because no iwx_rx_pkt() case claimed them.
+         *
+         *   u = how many such replies were discarded
+         *   c = wide id of the first one (0xffffffff = none)
+         *
+         * u=0 with a 35 timeout means the firmware really never answered (or
+         * the reply carried the uCode bit 7 in qid). u>0 means the driver
+         * dropped an answer that had arrived: add the missing case label for
+         * `c` next to the MLD labels in iwx_rx_pkt(). This is how the v333
+         * MAC_CONFIG timeout (id=0x308) would have been diagnosed in one boot.
+         */
+        snprintf(line, sizeof(line), "u=%u c=0x%x",
+                 (unsigned)sc->sc_diag_resp_unclaimed,
+                 (unsigned)sc->sc_diag_resp_uc_code);
+        iwx_set_diag_string(device, "xo", line);
+        device->setProperty("xe3-iwx-mld-api", sc->sc_use_mld_api, 32);
     }
 }
 
@@ -20589,6 +22971,14 @@ bool ItlIwx::
 intrFilter(OSObject *object, IOFilterInterruptEventSource *src)
 {
     ItlIwx *that = (ItlIwx*)object;
+    /*
+     * Diagnostic: the mask that was armed when this interrupt arrived. The
+     * filter then clears it, and only a completed ISR restores it, so a mask
+     * that is still 0 at the next snapshot means the device was left deaf
+     * (see iwx_intr()'s early-exit paths and iwx_restore_interrupts()).
+     * Interrupt context: no setProperty()/allocation here.
+     */
+    that->com.sc_diag_int_mask = IWX_READ(&that->com, IWX_CSR_INT_MASK);
     IWX_WRITE(&that->com, IWX_CSR_INT_MASK, 0);
     return true;
 }
@@ -20601,6 +22991,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     struct _ifnet *ifp = &ic->ic_if;
     int err;
     int txq_i, i, j;
+    int msixArg = 0;
     
     sc->sc_pct = pa->pa_pc;
     sc->sc_pcitag = pa->pa_tag;
@@ -20644,14 +23035,54 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         iwx_diag_fail(sc, "map-mem", "cannot-map-bar");
         return false;
     }
-    if (0) {
+    /*
+     * Interrupt transport selection.
+     *
+     * Linux always attempts MSI-X first and only falls back to single-vector
+     * MSI when pci_enable_msix_range() fails (pcie/trans.c:1606-1682), and it
+     * does so for every mq_rx_supported part - which SC is (cfg/sc.c:
+     * .mq_rx_supported = true). It then arms the ALIVE cause through
+     * CSR_MSIX_HW_INT_MASK_AD and the RX/FH causes through
+     * CSR_MSIX_FH_INT_MASK_AD (pcie/internal.h:1048-1061); it never touches
+     * CSR_INT_MASK on this path.
+     *
+     * This driver hard-coded the opposite (`if (0)` below), so it always ends
+     * up writing the legacy 0x00c register. The readback on the card says that
+     * write does not keep bit 31: the restore path writes 0x80000001 and the
+     * very next read returns 0x1. If that holds, the legacy path can never arm
+     * FH_RX, ALIVE (an FH RX packet) can never be delivered, and everything
+     * downstream is unreachable.
+     *
+     * -itlmsix selects the Linux behaviour so one build can test both
+     * transports without a rebuild. Default stays 0 (previous behaviour) so
+     * the first boot reproduces the baseline reading.
+     *
+     * Caveat, recorded so nobody over-reads a success: itl80211's
+     * pci_intr_map_msix() is a stub that just forwards to pci_intr_map_msi()
+     * (compat.cpp:73-88) and the vector it receives is still a single
+     * IOFilterInterruptEventSource, so this is "MSI-X register programming with
+     * one shared vector", exactly the shape Linux arrives at when
+     * pci_enable_msix_range() gives back fewer vectors than requested
+     * (num_irqs == max_irqs - 1 / <= max_irqs - 2, i.e. all causes on
+     * def_irq). It is enough to tell whether the *register set* is the
+     * blocker, which is the open question; it is not a full MSI-X port.
+     */
+    if (PE_parse_boot_argn("-itlmsix", &msixArg, sizeof(msixArg))) {
         sc->sc_msix = 1;
-        XYLog("msix intr mode\n");
+        XYLog("msix intr mode (requested by -itlmsix)\n");
     } else if (pci_intr_map_msi(pa, &sc->ih)) {
         XYLog("%s: can't map interrupt\n", DEVNAME(sc));
         iwx_diag_fail(sc, "map-msi", "cannot-map-msi");
         return false;
     }
+    /*
+     * Diagnostic only: publish which interrupt transport we actually use.
+     * The "if (0)" above pins sc_msix to 0, i.e. MSI single-vector; the whole
+     * iwx_conf_msix_hw()/iwx_intr_msix() path is dead code on this card.
+     * Recorded so a future MSI-X experiment has a baseline to compare against.
+     */
+    sc->sc_diag_msix_mode = sc->sc_msix;
+    iwx_publish_diag(sc);
     
     if (!sc->sc_msix) {
         /* Hardware bug workaround. */
@@ -20824,6 +23255,15 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
           sc->sc_hw_rev, sc->sc_hw_rf_id, sc->sc_cfg->fwname);
     sc->sc_fwname = sc->sc_cfg->fwname;
     sc->sc_device_family = sc->sc_cfg->device_family;
+    /*
+     * Bz and newer moved the MAC address block from 0x380 to 0x30.
+     * OpenBSD: if_iwx.c:12551-12554. Linux: cfg/sc.c:43. This driver used to
+     * hardcode 0x380 for every family, which made iwx_nvm_get() return EINVAL
+     * on SC after every earlier stage had already succeeded.
+     */
+    sc->sc_mac_addr_from_csr = (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+                                   ? IWX_CSR_ADDR_BASE_BZ
+                                   : IWX_CSR_ADDR_BASE_LEGACY;
     sc->sc_diag_cfg_found = 1;
     sc->sc_diag_cfg_name = sc->sc_cfg->name ? sc->sc_cfg->name : sc->sc_cfg->fwname;
     sc->sc_diag_fw_name = sc->sc_cfg->fwname;
@@ -21213,6 +23653,14 @@ iwx_init_task(void *arg1)
 #ifdef AIRPORT_WCL
     {
         int error = that->iwx_init(ifp);
+        /*
+         * Record the outcome before anything else touches state. A timeout
+         * here (EWOULDBLOCK) is the only path that skips
+         * IEEE80211_EVT_DRIVER_READY, which in turn leaves the IO80211 scan
+         * manager in HALTED and refuses every scan request.
+         */
+        sc->sc_diag_init_err = error;
+        that->iwx_publish_diag(sc);
         if (error && error != ENXIO && !(ifp->if_flags & IFF_RUNNING)) {
             sc->sc_ic.ic_wcl_mac_reconfig = false;
             ifp->if_flags &= ~IFF_UP;

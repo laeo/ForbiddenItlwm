@@ -1076,6 +1076,7 @@ IOReturn AirportItlwmSkywalkInterface::
 setSCAN_REQ(struct apple80211_scan_data *sd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
+    IOReturn rc;
 #if 0
     XYLog("%s Type: %u BSS Type: %u PHY Mode: %u Dwell time: %u Rest time: %u Num channels: %u SSID: %s BSSID: %s\n",
           __FUNCTION__,
@@ -1088,25 +1089,59 @@ setSCAN_REQ(struct apple80211_scan_data *sd)
           sd->ssid,
           ether_sprintf(sd->bssid.octet));
 #endif
-    if (!sd)
-        return kIOReturnBadArgument;
-    if (fScanResultWrapping)
-        return 22;
-    if (ic->ic_state <= IEEE80211_S_INIT)
-        return 22;
+    /*
+     * Record what macOS asked for and what we answered. IO80211 refuses the
+     * request itself when its scan manager is halted, in which case this is
+     * never reached; when it is reached, st and ch say whether the driver
+     * could have scanned at all.
+     */
+    {
+        int ch = 0;
+        for (int i = 0; i <= IEEE80211_CHAN_MAX; i++)
+            if (isset(ic->ic_chan_active, i))
+                ch++;
+        if (sd) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "n=%u ty=%u st=%d ch=%d",
+                     (unsigned)sd->num_channels, (unsigned)sd->scan_type,
+                     (int)ic->ic_state, ch);
+            if (instance)
+                instance->setProperty("xe3-scan-req", buf);
+        }
+    }
+    if (!sd) {
+        rc = kIOReturnBadArgument;
+        goto out;
+    }
+    if (fScanResultWrapping) {
+        rc = 22;
+        goto out;
+    }
+    if (ic->ic_state <= IEEE80211_S_INIT) {
+        rc = 22;
+        goto out;
+    }
     if (sd->scan_type == APPLE80211_SCAN_TYPE_FAST || sd->scan_type == APPLE80211_SCAN_TYPE_PASSIVE) {
         if (scanSource) {
             scanSource->setTimeoutMS(100);
             scanSource->enable();
         }
-        return kIOReturnSuccess;
+        rc = kIOReturnSuccess;
+        goto out;
     }
     ieee80211_begin_cache_bgscan(&ic->ic_ac.ac_if);
     if (scanSource) {
         scanSource->setTimeoutMS(100);
         scanSource->enable();
     }
-    return kIOReturnSuccess;
+    rc = kIOReturnSuccess;
+out:
+    if (instance) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "rc=%d st=%d", (int)rc, (int)ic->ic_state);
+        instance->setProperty("xe3-scan-rc", buf);
+    }
+    return rc;
 }
 
 extern OSDictionary *convertScanToDictionary(apple80211_scan_result *a1);

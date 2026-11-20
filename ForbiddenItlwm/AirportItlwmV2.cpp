@@ -2496,6 +2496,13 @@ setCOUNTRY_CODE(OSObject *object, struct apple80211_country_code_data *data)
     return kIOReturnSuccess;
 }
 
+/*
+ * How many times setPOWER() has actually been called. power_state is only
+ * written there, so a zero count means macOS never asked the radio to power
+ * up and getPOWER() has been answering "off" all along.
+ */
+static volatile SInt32 xe3SetPowerCalls;
+
 IOReturn AirportItlwm::
 getPOWER(OSObject *object,
                          struct apple80211_power_data *pd)
@@ -2508,6 +2515,19 @@ getPOWER(OSObject *object,
     pd->power_state[1] = power_state;
     pd->power_state[2] = power_state;
     pd->power_state[3] = power_state;
+    /*
+     * Publish what macOS is being told, and whether setPOWER() ever ran.
+     * power_state only changes inside setPOWER(); if this stays 0 forever the
+     * radio is reported off, IO80211 keeps its scan manager halted, and every
+     * scan request is refused. setpower tells the two cases apart.
+     */
+    if (pciNub) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "state=%u n=%u sp=%u",
+                 (unsigned)power_state, (unsigned)pd->num_radios,
+                 (unsigned)xe3SetPowerCalls);
+        pciNub->setProperty("xe3-power", buf);
+    }
     return kIOReturnSuccess;
 }
 
@@ -2535,6 +2555,9 @@ setPOWER(OSObject *object,
         }
         power_state = (pd->power_state[0]);
     }
+    /* Counted so getPOWER() can report whether macOS ever powered the radio. */
+    if (pd->num_radios > 0)
+        OSIncrementAtomic(&xe3SetPowerCalls);
 
     return kIOReturnSuccess;
 #else

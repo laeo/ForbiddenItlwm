@@ -237,24 +237,42 @@ IOReturn AirportItlwmSkywalkInterface::setWCL_LEAVE_NETWORK(apple80211_leave_net
 IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *request)
 {
     AirportWCL::ScanRequest scan;
+    ieee80211com *ic = fHalService->get80211Controller();
+    /*
+     * xe3 v331: this is the only live path for an IO80211 scan request --
+     * setWCL_SCAN_REQ() -> gate -> wclCommand case 0. (setSCAN_REQ() on the
+     * legacy apple80211 virtual interface is never called on this stack.)
+     * Counters only; every early return below keeps its original value.
+     */
+    ++ic->ic_diag_wcl_req;
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
-    ieee80211com *ic = fHalService->get80211Controller();
-    if (!(ic->ic_if.if_flags & IFF_RUNNING))
+    if (!(ic->ic_if.if_flags & IFF_RUNNING)) {
+        ++ic->ic_diag_wcl_notready;
         return kIOReturnNotReady;
-    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
+    }
+    ic->ic_diag_wcl_req_chans = scan.channelCount;
+    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN)) {
+        ++ic->ic_diag_wcl_busy;
         return kIOReturnBusy;
-    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+    }
+    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC) {
+        ++ic->ic_diag_wcl_busy;
         return kIOReturnBusy;
+    }
     if (scan.channelCount) {
         bool usable = false;
         for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX; ++channel)
             if (ic->ic_channels[channel].ic_flags &&
                 AirportWCL::scanChannelSelected(scan.channels, true, channel))
                 usable = true;
-        if (!usable)
+        if (!usable) {
+            ++ic->ic_diag_wcl_unsup;
             return kIOReturnUnsupported;
+        }
     }
+    if (ic->ic_state == IEEE80211_S_SCAN)
+        ++ic->ic_diag_wcl_reuse;
     scanPending = true;
     scanCompleted = false;
     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
@@ -273,6 +291,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             scanPending = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
+            ++ic->ic_diag_wcl_busy;
             return kIOReturnBusy;
         }
     } else if (ic->ic_state != IEEE80211_S_SCAN) {
@@ -281,6 +300,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             scanPending = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
+            ++ic->ic_diag_wcl_busy;
             return kIOReturnError;
         }
     }
@@ -289,12 +309,18 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
 
 void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
 {
+    ieee80211com *ic0 = fHalService->get80211Controller();
     if (!scanPending)
         return;
+    ++ic0->ic_diag_wcl_fin;
+    if (status == kIOReturnAborted)
+        ++ic0->ic_diag_wcl_abort;
+    else if (status == kIOReturnTimeout)
+        ++ic0->ic_diag_wcl_timeout;
     scanPending = false;
     scanCompleted = false;
     scanSource->cancelTimeout();
-    fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+    ic0->ic_wcl_scan_requested = false;
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
 }
 
@@ -306,18 +332,44 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
 
 void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
 {
-    if (!node || node->ni_esslen > 32 || !AirportWCL::validIEs(ies, length))
-        return;
+    /*
+     * xe3 v331: split the WCL-side losses by reason instead of one silent
+     * return. Nothing here changes behaviour; the counters are only read by
+     * itlwm/hal_iwx's diagnostic publisher.
+     *
+     * Linux strips the trailing MIC+CRC bytes that the hardware leaves in the
+     * buffer (mvm/rxmq.c, iwl_mvm_create_skb: `len -= mic_crc_len` unless
+     * RX_INCLUDES_FCS, which is only set in monitor context).  iwx(4) never did
+     * and neither did this port, so the 4-byte FCS stays inside mbuf_len().
+     * validIEs() insists the element stream ends exactly, so i4 - the same
+     * check with those 4 bytes dropped - is what separates "the frames are
+     * fine, the validator is wrong" from "the frames really are malformed".
+     */
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC)
+    ++ic->ic_diag_wcl_pub;
+    if (!node || node->ni_esslen > 32 || !AirportWCL::validIEs(ies, length)) {
+        ++ic->ic_diag_wcl_ies;
+        if (node && node->ni_esslen > 32)
+            ++ic->ic_diag_wcl_ssid;
+        if (length >= 4 && AirportWCL::validIEs(ies, length - 4))
+            ++ic->ic_diag_wcl_ies4;
         return;
+    }
+    if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC) {
+        ++ic->ic_diag_wcl_nochan;
+        return;
+    }
     unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
-    if (!channel || channel > 196)
+    if (!channel || channel > 196) {
+        ++ic->ic_diag_wcl_badchan;
         return;
+    }
     size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
-    if (!metadata)
+    if (!metadata) {
+        ++ic->ic_diag_wcl_nomem;
         return;
+    }
     *metadata = {};
     metadata->ieLength = uint32_t(length);
     metadata->channelSpec = uint16_t(channel | (IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
@@ -341,6 +393,10 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
         }
     }
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
+    ++ic->ic_diag_wcl_post;
+    ic->ic_diag_wcl_chspec = metadata->channelSpec;
+    if (!scanPending)
+        ++ic->ic_diag_wcl_pub_nopend;
     IOFree(metadata, size);
 }
 
@@ -439,9 +495,27 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         joinTimer->setTimeoutMS(30000);
         return kIOReturnSuccess;
     }
-    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
+    ++ic->ic_diag_wcl_join_req;
+    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending) {
         explicit_bzero(&join, sizeof(join));
+        if (!supported)
+            ++ic->ic_diag_wcl_join_unsup;
+        else
+            ++ic->ic_diag_wcl_join_busy;
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
+    }
+    /*
+     * xe3 v332: do not let a merely-pending scan starve an explicit join.
+     * IO80211 keeps issuing background/periodic scans, and every one of
+     * them used to make this function return kIOReturnBusy, which the UI
+     * renders as "nothing happened".  The abort below only tears down our
+     * own ScanDone bookkeeping -- net80211 stays in S_SCAN and keeps
+     * feeding beacons, which is exactly the state the one successful join
+     * on this hardware ran in.
+     */
+    if (scanPending) {
+        ++ic->ic_diag_wcl_join_aborted;
+        finishWCLScan(kIOReturnAborted);
     }
     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         leaveWCLNetwork();
@@ -833,9 +907,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         }
         case IEEE80211_EVT_SCAN_DONE:
             if (scanPending) {
-                if (scanSkipCompletion)
+                if (scanSkipCompletion) {
                     scanSkipCompletion = false;
-                else {
+                    ++ic->ic_diag_wcl_skip;
+                } else {
                     scanCompleted = true;
                     scanSource->setTimeoutMS(0);
                 }
