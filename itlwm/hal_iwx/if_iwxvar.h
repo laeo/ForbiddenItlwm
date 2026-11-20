@@ -385,6 +385,13 @@ struct iwx_rx_ring {
 	void	        *stat;
 	struct iwx_rx_data	data[IWX_RX_MQ_RING_COUNT];
 	int			cur;
+	/*
+	 * Linux keeps rxq->id for the same reason: the free-RBD write pointer on
+	 * Bz/SC has to be pushed through HBUS_TARG_WRPTR with the queue number in
+	 * bits [31:16] (RX queues are offset by 512). Always 0 on iwx (single
+	 * default queue), but explicit beats hard-coding it at the write site.
+	 */
+	int			qid;
 };
 
 #define IWX_FLAG_USE_ICT	0x01	/* using Interrupt Cause Table */

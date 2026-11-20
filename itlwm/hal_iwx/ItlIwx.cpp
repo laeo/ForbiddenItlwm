@@ -2707,6 +2707,13 @@ iwx_alloc_rx_ring(struct iwx_softc *sc, struct iwx_rx_ring *ring)
     int rb_stts_align = sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ? 0 : 16;
     
     ring->cur = 0;
+    /*
+     * Linux's rxq->id (used by iwl_pcie_rxq_inc_wr_ptr to compute
+     * HBUS_TARG_WRPTR_RX_Q) is 0 for the default/fallback queue.
+     * iwx rxq is always queue 0, but keep it explicit now that the write
+     * pointer helper needs it.
+     */
+    ring->qid = 0;
     
     /* Allocate RX descriptors (256-byte aligned). */
     size = IWX_RX_MQ_RING_COUNT * (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ? sizeof(struct iwx_rx_transfer_desc) : sizeof(uint64_t));
@@ -3332,7 +3339,18 @@ iwx_apm_init(struct iwx_softc *sc)
      * Set "initialization complete" bit to move adapter from
      * D0U* --> D0A* (powered-up active) state.
      */
-    IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, iwx_init_done_bit(sc));
+    /*
+     * Bz/SC: Linux asserts the MAC-access request together with MAC_INIT
+     * (iwl_pcie_activate_nic(), pcie/trans.c, ">= IWL_DEVICE_FAMILY_BZ"),
+     * then polls MAC_STATUS. Setting only MAC_INIT leaves the host without
+     * an explicit access request while the MAC is coming up.
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+                    IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ |
+                    iwx_init_done_bit(sc));
+    else
+        IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, iwx_init_done_bit(sc));
     
     /*
      * Wait for clock stabilization; once stabilized, access to
@@ -3636,6 +3654,18 @@ iwx_nic_config(struct iwx_softc *sc)
 {
     uint8_t radio_cfg_type, radio_cfg_step, radio_cfg_dash;
     uint32_t mask, val, reg_val = 0;
+    
+    /*
+     * Linux returns before touching CSR_HW_IF_CONFIG_REG from AX210 onwards
+     * (iwl_mvm_nic_config(), mvm/ops.c: "if (device_family >=
+     * IWL_DEVICE_FAMILY_AX210) return;"). The MAC_STEP/MAC_DASH/PHY_* fields
+     * below are pre-AX210 SKU-identification bits; on Bz/SC this register
+     * carries different state (PCI_OWN_SET at bit 22, WAKE_ME at bit 27) and
+     * programming stale pre-AX210 fields risks presenting a bogus SKU to the
+     * ROM. Do what Linux does and leave it alone on SC.
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
+        return;
     
     radio_cfg_type = (sc->sc_fw_phy_config & IWX_FW_PHY_CFG_RADIO_TYPE) >>
     IWX_FW_PHY_CFG_RADIO_TYPE_POS;
@@ -5297,7 +5327,14 @@ iwx_load_firmware(struct iwx_softc *sc)
         return err;
     }
     
-    err = iwx_wait_notification(sc, &sc->sc_uc.uc_intr, 1, 1000);
+    /*
+     * 2000 ms, not 1000: Linux waits MVM_UCODE_ALIVE_TIMEOUT = 2 * HZ for the
+     * ALIVE notification (mvm/fw.c:28, :328-329). sc-a0-gf-a0-100 is a
+     * 1.8 MB image spread over 70 SEC_RT sections; 1 s was not enough on the
+     * PTL card and produced alive-loops=35 (EWOULDBLOCK) with no diagnostic
+     * distinction between "firmware never started" and "interrupt lost".
+     */
+    err = iwx_wait_notification(sc, &sc->sc_uc.uc_intr, 1, 2000);
     /*
      * Snapshot the registers that decide "did the firmware actually start"
      * before anything below can change them. Read unconditionally: on the
@@ -18661,6 +18698,34 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
         mbuf_freem(m0);
 }
 
+/*
+ * Push the RX free-RBD write index to the device.
+ *
+ * Linux split this by family in iwl_pcie_rxq_inc_wr_ptr() (pcie/rx.c:185-202):
+ *
+ *   !mq_rx_supported        -> FH_RSCSR_CHNL0_WPTR
+ *   >= IWL_DEVICE_FAMILY_BZ -> HBUS_TARG_WRPTR, value | HBUS_TARG_WRPTR_RX_Q(id)
+ *   otherwise (AX210/So/Ma) -> RFH_Q_FRBDCB_WIDX_TRG(q)
+ *
+ * Bz/SC replaced the per-queue RFH trigger register with the shared HBUS
+ * mailbox, where RX queues are addressed as queue id + 512 in bits [31:16].
+ * itlwm unconditionally wrote RFH_Q0_FRBDCB_WIDX_TRG (0x1C80), so on SC the
+ * "buffers are free" update never reached the correct register. That matters
+ * for ALIVE: ALIVE itself arrives as an FH RX packet, and the RX ring must be
+ * restocked from the driver side for the notification to be readable.
+ */
+void ItlIwx::
+iwx_rx_inc_wr_ptr(struct iwx_softc *sc, struct iwx_rx_ring *ring, uint32_t val)
+{
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        /* Rx queue ids are offset by 512 in the shared HBUS write pointer. */
+        IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR,
+                  val | ((uint32_t)(ring->qid + 512) << 16));
+    } else {
+        IWX_WRITE(sc, IWX_RFH_Q_FRBDCB_WIDX_TRG(ring->qid), val);
+    }
+}
+
 void ItlIwx::
 iwx_notif_intr(struct iwx_softc *sc)
 {
@@ -18688,7 +18753,7 @@ iwx_notif_intr(struct iwx_softc *sc)
      * Seems like the hardware gets upset unless we align the write by 8??
      */
     hw = (hw == 0) ? IWX_RX_MQ_RING_COUNT - 1 : hw - 1;
-    IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, hw & ~7);
+    iwx_rx_inc_wr_ptr(sc, &sc->rxq, hw & ~7);
 }
 
 int ItlIwx::
@@ -18747,7 +18812,7 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
         /* Firmware has now configured the RFH. */
         for (i = 0; i < IWX_RX_MQ_RING_COUNT; i++)
             that->iwx_update_rx_desc(sc, &sc->rxq, i);
-        IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, 8);
+        iwx_rx_inc_wr_ptr(sc, &sc->rxq, 8);
     }
     
     handled |= (r1 & (IWX_CSR_INT_BIT_ALIVE /*| IWX_CSR_INT_BIT_SCD*/));
@@ -18918,7 +18983,7 @@ iwx_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count)
         /* Firmware has now configured the RFH. */
         for (i = 0; i < IWX_RX_MQ_RING_COUNT; i++)
             that->iwx_update_rx_desc(sc, &sc->rxq, i);
-        IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, 8);
+        iwx_rx_inc_wr_ptr(sc, &sc->rxq, 8);
     }
     
     /*
