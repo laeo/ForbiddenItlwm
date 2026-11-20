@@ -14253,6 +14253,21 @@ iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
 int ItlIwx::
 iwx_clear_statistics(struct iwx_softc *sc)
 {
+    /*
+     * SC (BZ) firmware declares only SYSTEM_STATISTICS_CMD v1 in TLV 48
+     * (cmd 0x0f, group 0x02) and has no entry for the legacy
+     * STATISTICS_CMD 0x9c. Sending 0x9c makes the firmware drop the
+     * command; the 1 s command sleep expires and the following teardown
+     * commands time out too (v337 real machine: xd10="id=0x19c e=35",
+     * xd13="f=0x19c,0x309,0x308,0xffffffff"). Clearing counters is not
+     * required before association, and Linux only requests them from the
+     * U-APSD TCM path, not from auth. Keep the legacy command for
+     * AX210/22000 and skip it on SC until the v1 command plus the 0xfd
+     * end notification are implemented.
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        return 0;
+
     struct iwx_statistics_cmd scmd = {
         .flags = htole32(IWX_STATISTICS_FLG_CLEAR)
     };
