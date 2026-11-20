@@ -527,6 +527,8 @@ public:
             struct mbuf_list *);
     void    iwx_rx_inc_wr_ptr(struct iwx_softc *, struct iwx_rx_ring *,
             uint32_t);
+    uint32_t iwx_rx_restock_aligned(struct iwx_softc *,
+            struct iwx_rx_ring *);
     void    iwx_notif_intr(struct iwx_softc *);
     static int    iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count);
     static int    iwx_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count);

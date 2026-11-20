@@ -18726,6 +18726,44 @@ iwx_rx_inc_wr_ptr(struct iwx_softc *sc, struct iwx_rx_ring *ring, uint32_t val)
     }
 }
 
+/*
+ * How many free RBDs may be advertised to the firmware right now.
+ *
+ * Linux restocks the ring and then publishes an 8-aligned write index
+ * (iwl_pcie_rxmq_restock() -> iwl_pcie_rxq_inc_wr_ptr(), pcie/rx.c:246-288).
+ * The ALIVE handler used to publish a hard 8, which on a ring whose
+ * descriptors were all just refreshed leaves 504 of them unreachable: the
+ * firmware only hands back buffers below the published index.
+ *
+ * The hardware index is re-read here rather than reused from the caller,
+ * because the caller's snapshot was taken before 512 descriptors were
+ * rewritten and the firmware may have moved the index since.
+ */
+uint32_t ItlIwx::
+iwx_rx_restock_aligned(struct iwx_softc *sc, struct iwx_rx_ring *ring)
+{
+    uint32_t hw;
+
+    if (ring->stat == NULL)
+        return IWX_RX_MQ_RING_COUNT;
+
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
+        hw = le16toh(*(uint16_t *)(ring->stat)) & 0xfff;
+    else
+        hw = le16toh(((struct iwx_rb_status *)ring->stat)->closed_rb_num) & 0xfff;
+    hw &= (IWX_RX_MQ_RING_COUNT - 1);
+
+    /*
+     * A wrapped (or brand new) index of 0 means "nothing consumed yet", which
+     * for the free ring means the whole ring is available. Publishing 0 would
+     * tell the firmware there is no room at all.
+     */
+    if (hw == 0)
+        hw = IWX_RX_MQ_RING_COUNT;
+
+    return hw & ~7u;
+}
+
 void ItlIwx::
 iwx_notif_intr(struct iwx_softc *sc)
 {
@@ -18812,7 +18850,15 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
         /* Firmware has now configured the RFH. */
         for (i = 0; i < IWX_RX_MQ_RING_COUNT; i++)
             that->iwx_update_rx_desc(sc, &sc->rxq, i);
-        iwx_rx_inc_wr_ptr(sc, &sc->rxq, 8);
+        /*
+         * Publish every descriptor just refreshed, rounded down to the
+         * 8-buffer granularity the hardware requires (Linux
+         * iwl_pcie_rxq_inc_wr_ptr: round_down(rxq->write, 8)). A hard 8 here
+         * advertises 8 usable RBDs out of 512 on a ring the firmware has not
+         * touched yet.
+         */
+        that->iwx_rx_inc_wr_ptr(sc, &sc->rxq,
+                                that->iwx_rx_restock_aligned(sc, &sc->rxq));
     }
     
     handled |= (r1 & (IWX_CSR_INT_BIT_ALIVE /*| IWX_CSR_INT_BIT_SCD*/));
@@ -18849,7 +18895,8 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
         if ((sc->sc_flags & IWX_FLAG_SHUTDOWN) == 0)
             task_add(systq, &sc->init_task);
         rv = 1;
-        goto out;
+        /* Re-arm on the way out; iwx_init_task reprograms the mask later. */
+        goto out_ena;
         
     }
     
@@ -18861,7 +18908,8 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
             task_add(systq, &sc->init_task);
         }
         rv = 1;
-        goto out;
+        /* Same as SW_ERR: re-arm rather than leaving the mask at 0. */
+        goto out_ena;
     }
     
     /* firmware chunk loaded */
@@ -18983,7 +19031,15 @@ iwx_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count)
         /* Firmware has now configured the RFH. */
         for (i = 0; i < IWX_RX_MQ_RING_COUNT; i++)
             that->iwx_update_rx_desc(sc, &sc->rxq, i);
-        iwx_rx_inc_wr_ptr(sc, &sc->rxq, 8);
+        /*
+         * Publish every descriptor just refreshed, rounded down to the
+         * 8-buffer granularity the hardware requires (Linux
+         * iwl_pcie_rxq_inc_wr_ptr: round_down(rxq->write, 8)). A hard 8 here
+         * advertises 8 usable RBDs out of 512 on a ring the firmware has not
+         * touched yet.
+         */
+        that->iwx_rx_inc_wr_ptr(sc, &sc->rxq,
+                                that->iwx_rx_restock_aligned(sc, &sc->rxq));
     }
     
     /*
@@ -20445,6 +20501,48 @@ iwx_publish_diag(struct iwx_softc *sc)
     iwx_set_diag_string(device, "xe3-iwx-pnvm", sc->sc_diag_pnvm);
     device->setProperty("xe3-iwx-alive", sc->sc_diag_alive, 32);
     iwx_set_diag_string(device, "xe3-iwx-init", sc->sc_diag_init);
+
+    /*
+     * Short-name rollups.
+     *
+     * The only keyboard available on this machine during a test run is a
+     * hand-typed one in the installer Terminal: no scripts, no paste, no
+     * photographs. A diagnostic that needs a 60-character quoted attribute
+     * name is unusable there. `ioreg -c IOPCIEDevice` is 21 characters and
+     * dumps every property, but with -c only it prints the compact form, so
+     * these two strings carry the same evidence in one grep-able line each.
+     *
+     * Deliberately a stable field order with short keys, so a single value
+     * can be written down by hand:
+     *
+     *   xd  = "s=70 l=1696040 a=0 m=0x... i=1 r=0 f=1"
+     *         sects / sectlen / alive / int_mask / intr-count / rxq-cur /
+     *         fh-int-status
+     *   xd2 = "g=0x... b=0 p=0 t=load-init-fw c=53209,2819"
+     *         gp-cntrl / prph-boot-stage / prph-ipc / stage / secboot cpu1,2
+     */
+    {
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "s=%d l=%u a=%d m=0x%x i=%u r=%d f=0x%x",
+                 sc->sc_diag_sect_count,
+                 (unsigned)sc->sc_diag_sect_len_total,
+                 sc->sc_diag_alive,
+                 (unsigned)sc->sc_diag_int_mask,
+                 (unsigned)sc->sc_diag_intr_count,
+                 sc->sc_diag_rxq_cur,
+                 (unsigned)sc->sc_diag_fh_int_status);
+        iwx_set_diag_string(device, "xd", line);
+        snprintf(line, sizeof(line),
+                 "g=0x%x b=%u p=%u t=%s c=%u,%u",
+                 (unsigned)sc->sc_diag_gp_cntrl,
+                 (unsigned)sc->sc_diag_prph_boot_stage,
+                 (unsigned)sc->sc_diag_prph_ipc,
+                 sc->sc_diag_stage != NULL ? sc->sc_diag_stage : "?",
+                 (unsigned)sc->sc_diag_secboot_cpu1,
+                 (unsigned)sc->sc_diag_secboot_cpu2);
+        iwx_set_diag_string(device, "xd2", line);
+    }
 }
 
 bool ItlIwx::
