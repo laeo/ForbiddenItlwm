@@ -13156,11 +13156,36 @@ iwx_config_umac_scan(struct iwx_softc *sc)
     scan_config->tx_chains = htole32(iwx_fw_valid_tx_ant(sc));
     scan_config->rx_chains = htole32(iwx_fw_valid_rx_ant(sc));
     
-    cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
-    if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 12)
-        scan_config->bcast_sta_id = IWX_AUX_STA_ID;
-    else if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 5)
-        scan_config->bcast_sta_id = 0xFF;
+    /*
+     * xe3-macos [SC]: do not advertise a station id that does not exist.
+     *
+     * bcast_sta_id is the station the firmware reports scan/ROC traffic on.
+     * It is deprecated from SCAN_CFG_CMD version 5 on -- Linux leaves it at 0
+     * for that case (mvm/scan.c:1263-1271, comment "Fw doesn't use this sta
+     * anymore. Deprecated on SCAN_CFG_CMD version 5") and OpenBSD does the
+     * same (ob-if_iwx.c:7496-7498).  SC firmware declares SCAN_CFG_CMD v5
+     * (TLV 48: group 1 / cmd 0x0c -> 5) and, like Bz, owns the auxiliary
+     * station internally -- which is exactly why iwx_add_aux_sta() is
+     * skipped for this family -- so IWX_AUX_STA_ID (=1) names a station that
+     * was never created here.
+     *
+     * The lookup below also asks the wrong command: ADD_STA is absent from
+     * SC's version table, so it returns IWX_FW_CMD_VER_UNKNOWN (=99) and the
+     * first branch fires.  Linux treats an undeclared ADD_STA as "new
+     * station API" (IWL_FW_CMD_VER_UNKNOWN == 99, so 99 >= 12) and writes 0.
+     *
+     * Only pre-SC families keep the historical aux-station id, so AX210 and
+     * older behave bit-for-bit as before.
+     */
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
+        scan_config->bcast_sta_id = 0;
+    } else {
+        cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
+        if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 12)
+            scan_config->bcast_sta_id = IWX_AUX_STA_ID;
+        else if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 5)
+            scan_config->bcast_sta_id = 0xFF;
+    }
     
     hcmd.data[0] = scan_config;
     hcmd.len[0] = cmd_size;
