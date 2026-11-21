@@ -2457,6 +2457,19 @@ IOReturn AirportItlwm::setHardwareAddress(const void *addrP, UInt32 addrBytes)
     }
     if (!bsdInterface || !bsdInterface->getIfnet())
         return kIOReturnNotReady;
+    /*
+     * Keep ic_myaddr in sync with the address WCL asked for.
+     *
+     * if_setlladdr() below only updates ac_enaddr. ic_myaddr is the value
+     * planMacUpdate() compares against on the next replay, the value
+     * iwx_mac_ctxt_cmd_common() programs into the firmware MAC context, and
+     * the source address net80211 puts in frame headers. Leaving it at the
+     * hardware address makes every WCL replay look like a new change, so this
+     * function disables/enables the driver again and again: the link never
+     * stays up long enough for DHCP to finish. With the sync the replay is
+     * Unchanged and the random/private address sticks.
+     */
+    IEEE80211_ADDR_COPY(ic->ic_myaddr, address);
     // WCL calls this directly, bypassing IOEthernetInterface's normal MAC ioctl.
     // Update the BSD address used by DHCP/ARP as well as the firmware address.
     errno_t error = ifnet_set_lladdr(bsdInterface->getIfnet(), address, addrBytes);
