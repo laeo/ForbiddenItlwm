@@ -2110,8 +2110,16 @@ iwx_read_firmware(struct iwx_softc *sc)
      * loop above, so this is the first point where the answer exists.
      */
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT) &&
-        sc->sc_device_family >= IWX_DEVICE_FAMILY_SC)
+        sc->sc_device_family >= IWX_DEVICE_FAMILY_SC) {
         sc->sc_use_mld_api = 1;
+        /*
+         * MLD firmware keeps its own scan/join state machine and tolerates a
+         * join while a scan is pending; the WCL scan manager, on the other
+         * hand, only drops scanPending once it gets a scan-done event, so a
+         * Busy join here can livelock with the next scan request.
+         */
+        sc->sc_ic.ic_wcl_join_during_scan = 1;
+    }
     
 parse_out:
     if (err) {

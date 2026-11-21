@@ -452,6 +452,14 @@ struct ieee80211com {
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;
     bool ic_wcl_scan_requested;
+    /*
+     * SC/MLD firmware only: allow a join request to proceed while a WCL scan
+     * is still marked pending. Without this the join is answered Busy for as
+     * long as the scan manager keeps a scan outstanding, and since a failed
+     * join triggers another scan, the two can livelock and the interface
+     * never reaches DHCP. Left clear for every other device family.
+     */
+    bool ic_wcl_join_during_scan;
     bool ic_wcl_scan_active;
     uint8_t ic_wcl_scan_ssid_length;
     uint8_t ic_wcl_scan_ssid[32];
