@@ -239,6 +239,11 @@ public:
     void setPowerStateOff(void);
     void setPowerStateOn(void);
     void unregistPM();
+    // Called from the power-state thread call, which is not an IOService.
+    void pmCallEnter();
+    void pmCallExit();
+    bool waitForPowerCallToFinish();
+    void releasePmCallLock();
     bool initPCIPowerManagment(IOPCIDevice *provider);
 
     FUNC_IOCTL_GET(CARD_CAPABILITIES, apple80211_capability_data)
@@ -277,6 +282,16 @@ public:
     //pm
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;
+    /*
+     * thread_call_cancel_wait() is a private KPI: the kernel lists it in
+     * nm output but does not export it, so a third-party kext fails to load with
+     * "could not find a kext which exports this symbol" (the official 0.5.0
+     * release binary fails the same way, and a 20-line probe does too).
+     * unregistPM() therefore uses the public thread_call_cancel() plus this
+     * counter, which setPowerState's retain/release pairs keep in step.
+     */
+    IOLock *pmCallLock;
+    volatile UInt32 pmCallInFlight;
     UInt32 pmPowerState;
     IOService *pmPolicyMaker;
     UInt8 pmPCICapPtr;

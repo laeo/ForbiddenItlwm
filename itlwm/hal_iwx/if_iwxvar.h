@@ -125,6 +125,8 @@
 #define IWL_CFG_MAC_TYPE_SOF        0x43
 #define IWL_CFG_MAC_TYPE_MA        0x44
 #define IWL_CFG_MAC_TYPE_BZ        0x46
+/* Scarborough (Wi-Fi 7 BE2xx on Panther Lake and later). Linux: IWL_CFG_MAC_TYPE_SC. */
+#define IWL_CFG_MAC_TYPE_SC        0x48
 
 #define IWL_CFG_RF_TYPE_TH        0x105
 #define IWL_CFG_RF_TYPE_TH1        0x108
@@ -225,7 +227,13 @@ struct iwx_tx_radiotap_header {
 	 (1 << IEEE80211_RADIOTAP_RATE) |				\
 	 (1 << IEEE80211_RADIOTAP_CHANNEL))
 
-#define IWX_UCODE_SECT_MAX 60
+/*
+ * Scarborough (sc-a0) firmware carries 70 SEC_RT sections, more than the 60 the
+ * Qu/So/Ma parts use. Linux keeps a 96 entry table (IWL_UCODE_SECTION_MAX is sized
+ * from the biggest firmware, not from the oldest). With 60 the parse stops at
+ * section 61 with EINVAL and the driver reports "firmware parse error 22".
+ */
+#define IWX_UCODE_SECT_MAX 96
 
 /*
  * fw_status is used to determine if we've already parsed the firmware file
@@ -261,6 +269,13 @@ struct iwx_fw_info {
 	size_t fw_rawsize;
     void *pnvm_rawdata;
     size_t pnvm_rawsize;
+	/*
+	 * PNVM payload embedded in the firmware image itself
+	 * (IWL_UCODE_TLV_PNVM_DATA = 74). Points into the decompressed
+	 * fw_rawdata buffer, so it lives as long as fw_rawdata does.
+	 */
+	const uint8_t *pnvm_embedded;
+	size_t pnvm_embedded_len;
 	int fw_status;
 
 	struct iwx_fw_sects fw_sects[IWX_UCODE_TYPE_MAX];
@@ -377,6 +392,13 @@ struct iwx_rx_ring {
 	void	        *stat;
 	struct iwx_rx_data	data[IWX_RX_MQ_RING_COUNT];
 	int			cur;
+	/*
+	 * Linux keeps rxq->id for the same reason: the free-RBD write pointer on
+	 * Bz/SC has to be pushed through HBUS_TARG_WRPTR with the queue number in
+	 * bits [31:16] (RX queues are offset by 512). Always 0 on iwx (single
+	 * default queue), but explicit beats hard-coding it at the write site.
+	 */
+	int			qid;
 };
 
 #define IWX_FLAG_USE_ICT	0x01	/* using Interrupt Cause Table */
@@ -650,8 +672,334 @@ struct iwx_softc {
     const struct iwl_cfg_trans_params *sc_cfg_params;
     const struct iwl_cfg *sc_cfg;
 	int sc_device_family;
+	/*
+	 * Base of the MAC address CSR block: 0x30 for Bz/SC, 0x380 for
+	 * AX210 and older. See IWX_CSR_ADDR_BASE_* in if_iwxreg.h for why
+	 * this cannot be a compile-time constant.
+	 */
+	int sc_mac_addr_from_csr;
+	/*
+	 * Firmware speaks the MLD API: MAC_CONF_GROUP (0x03) MAC_CONFIG /
+	 * LINK_CONFIG / STA_CONFIG instead of MAC_CONTEXT_CMD / BINDING_CONTEXT_CMD
+	 * / ADD_STA. Set from IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT (110) once the
+	 * capability TLV has been parsed and only for family >= SC.
+	 *
+	 * On sc-a0 this is the difference between a working association and a
+	 * 1 s EWOULDBLOCK on 0x128 (group 1) or 0xE28 (group 14): the firmware
+	 * registers MAC_CONFIG/LINK_CONFIG/STA_CONFIG in group 3 and nothing
+	 * else, and there is no MAC_CONTEXT command in that set at all.
+	 */
+	int sc_use_mld_api;
 #define IWX_DEVICE_FAMILY_22000	1
 #define IWX_DEVICE_FAMILY_AX210	2
+/*
+ * Placed after AX210 on purpose: every ">= IWX_DEVICE_FAMILY_AX210" test in this
+ * file is a gen3/v2 context-info or AX210-and-later register test, which SC
+ * (gen2=true, integrated=true, umac_prph_offset=0x300000 in Linux iwl_sc_mac_cfg)
+ * also needs. The comparisons that must not include SC are the ones against
+ * IWX_DEVICE_FAMILY_22000, and those stay false either way.
+ */
+#define IWX_DEVICE_FAMILY_SC	3
+
+	/* TLV sets dropped because they pointed past the driver's bit arrays.
+	 * Non-zero on sc-a0 is expected and harmless: Linux warns and goes on. */
+	/* Raw CSR snapshots taken when ALIVE fails, to tell "firmware never
+	 * started" from "firmware started but the notification never arrived". */
+	/*
+	 * Interrupt-side evidence. ALIVE arrives as an interrupt, so "did an
+	 * interrupt ever arrive at all" is the first fork when it does not show
+	 * up. These are bumped from the interrupt filter/action and only copied
+	 * context: setProperty allocates and takes locks).
+	 */
+	/*
+	 * Immediate write->readback pair for CSR_INT_MASK (0x00c).
+	 *
+	 * *after* something else touched the register (intrFilter() zeroes it on
+	 * every interrupt entry, iwx_restore_interrupts() re-arms with
+	 * sc_intmask, and the publish-time read races both). Reading the
+	 * register back inside the same function that wrote it, before any ISR
+	 * can run, is the only way to tell "the hardware refused a bit" from
+	 * "a later software path rewrote it".
+	 *
+	 * want = the value we asked for, rb = what the register returned,
+	 * tag = which call site produced the pair.
+	 */
+	/*
+	 * rxq->stat (the RB status word the RX DMA engine writes back) sampled
+	 * once, right after the firmware kick. Compared against the live value at
+	 * publish time it says whether the firmware ever handed a packet to the
+	 * driver's own ring. ALIVE is delivered as an FH RX packet, so an
+	 * unchanged index means either "the firmware never got that far" or "it
+	 * wrote but the doorbell/interrupt never reached us"; an advanced index
+	 * with alive==0 pins the failure to the interrupt path.
+	 */
+	/*
+	 * Last value actually pushed to the RX free-RBD write pointer, and how
+	 * many times it was pushed. iwx_notif_intr() recomputes the pointer from
+	 * the firmware's own consumed index at the end of every call:
+	 *
+	 *     hw = (hw == 0) ? IWX_RX_MQ_RING_COUNT - 1 : hw - 1;
+	 *     iwx_rx_inc_wr_ptr(sc, &sc->rxq, hw & ~7);
+	 *
+	 * With hw = 4 that rounds down to 0, i.e. "zero free RBDs". If the
+	 * firmware honours that it stops delivering, and every later H2G command
+	 * ack (INIT_EXTENDED_CFG included) is lost - which looks exactly like
+	 * "command sent but never acknowledged" (EWOULDBLOCK). Recording the
+	 * published value distinguishes that from a genuinely broken TX path.
+	 */
+	/* Peripheral-information mirrors written by the firmware into host DRAM
+	 * (struct iwx_prph_info). Positive evidence that the firmware is really
+	 * executing, as opposed to sitting in ROM. */
+	/* RX ring bookkeeping: ALIVE is an FH RX packet. If the hardware index
+	 * never moved, the packet was never written. */
+	/* xe3 v331: trailing MIC+CRC bytes stripped in iwx_rx_mpdu_mq(). */
+	/* Raw CSR snapshots taken from the ALIVE-failure path. */
+	/* SecBoot / PC state, only valid when iwx_nic_lock() succeeded. */
+	/*
+	 * prph_scratch.ctrl_cfg.pnvm_cfg as it stands when the INIT_COMPLETE
+	 * wait fails. The firmware learns where the PNVM payload lives only from
+	 * these two fields; if pnvm_size is 0 the firmware has nothing to
+	 * validate the channel/regulatory tables against, which is the current
+	 * best explanation for "answers PNVM_INIT_COMPLETE but never sends
+	 * INIT_COMPLETE". Both stay 0 unless iwx_pnvm_handle_section() reached
+	 * the point where it writes them.
+	 */
+	/*
+	 * Return value of the PNVM_INIT_COMPLETE wait inside iwx_load_pnvm().
+	 *
+	 * This is the number that decides whether the whole init sequence gets to
+	 * run at all: iwx_load_pnvm() returns it, iwx_load_ucode_wait_alive()
+	 * propagates it (:5786), and iwx_run_init_mvm_ucode() bails out at :5820 -
+	 * which is BEFORE :5830, so every xd3 field stays at its initialiser and
+	 * the boot yields no information about PNVM or INIT at all.
+	 *
+	 * Sampled right after the wait, before any early return, so it is valid
+	 * even when the wait failed. 0x7fffffff = never reached.
+	 */
+	/*
+	 * Which DRAM layout was handed to the firmware, decided by
+	 * IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG.
+	 *
+	 * This is the one reading that pnvm_size cannot provide: both layouts
+	 * report the same byte count, so a non-zero pnvm_size proves the payload
+	 * was published but not that the address points at something the firmware
+	 * can dereference. 0 = not reached, 1 = flat, 2 = fragmented.
+	 */
+	/* Number of payload sections published (0 when not reached). */
+	/*
+	 * iwx_nvm_get() had three silent failure paths: send_cmd error,
+	 * response-length mismatch, and invalid MAC address. All three left
+	 * not say which one fired. These four fields make the answer explicit.
+	 *
+	 *   nvm_err  : the errno iwx_nvm_get() returned (0x7fffffff never ran)
+	 *   nvm_alen : actual payload length of the NVM_GET_INFO response
+	 *   nvm_xlen : payload length the driver expected
+	 *   nvm_v4   : 1 if the driver used the v4 response layout
+	 *   nvm_mac  : first three bytes of the MAC it decoded (0xffffff = n/a)
+	 */
+	/*
+	 * Return codes of the three commands that iwx_run_init_mvm_ucode()
+	 * issues between ALIVE and the INIT_COMPLETE wait. All three are
+	 * failure path the only observable evidence is these numbers. Recorded
+	 * verbatim (negative errno), 0x7fffffff = never reached.
+	 */
+	/*
+	 * INIT_COMPLETE observation, split so a single boot answers two
+	 * different questions.
+	 *
+	 * immediately BEFORE iwx_wait_notification() sleeps. IWX_INIT_COMPLETE
+	 * (0x01) already set means the notification arrived during the
+	 * preceding commands and this wait returns without sleeping - i.e. the
+	 * firmware DID send it. Zero means it had not arrived yet, so a
+	 * subsequent timeout is a real "firmware never sent it".
+	 *
+	 * EWOULDBLOCK = 35 = timed out, other = aborted).
+	 */
+	/*
+	 * MSI-X live cause snapshot taken AFTER the INIT_EXTENDED_CFG timeout.
+	 * (non-MSI-X) cause register and carries no information once sc_msix=1.
+	 * These three are the registers the MSI-X handler actually looks at, so
+	 * a non-zero fhc after the timeout means the firmware did raise
+	 * something and the vector simply never reached us.
+	 */
+	/*
+	 * CSR_DRAM_INT_TBL_REG as read back after iwx_post_alive().
+	 *
+	 * Linux never writes this register on MSI-X: iwl_pcie_alloc_ict() is
+	 * only called in the non-msix branch (pcie/gen1_2/trans.c:3911-3917),
+	 * and iwl_pcie_reset_ict() returns immediately when ict_tbl == NULL
+	 * (pcie/gen1_2/rx.c:2218-2219). itlwm allocates ict_dma unconditionally
+	 * (ItlIwx.cpp:21195) and iwx_ict_reset() writes the register without a
+	 * sc_msix check, so bit 31 (ENABLE) may be telling this device to route
+	 * MSI-X causes into the DRAM table instead of CSR_MSIX_*_CAUSES_AD.
+	 * Non-zero here with sc_msix == 1 is the smoking gun for fh=hw=0.
+	 */
+	/*
+	 * Content of the ICT DRAM table at the moment INIT_EXTENDED_CFG timed
+	 * out. iwx_ict_reset() memsets the table to zero right before it enables
+	 * the hardware pointer, so anything non-zero here was written by the
+	 * firmware afterwards. This is what separates "the firmware deposited
+	 * causes into the DRAM table and the MSI-X handler therefore never saw
+	 * them" from "the firmware stayed silent for an unrelated reason" -
+	 * without it, a passing ict-gate run cannot distinguish the two.
+	 */
+	/*
+	 * RX hardware index re-read right after the timeout. The only other
+	 * sample of it is taken before any command is issued, so without this
+	 * "the firmware stopped feeding the ring" is an assumption, not a
+	 * measurement.
+	 */
+	/*
+	 * RX accounting for the "scans run but almost nothing is found" stage.
+	 *
+	 * 43 full scans of 38 channels produce ~1300 RX frames in total, i.e.
+	 * roughly one frame per channel dwell, while the same radio under Linux
+	 * sees 30+ BSS on every scan. That number alone does not say *where* the
+	 * frames are lost, so four counters split it:
+	 *
+	 *   rx_mpdu      IWX_REPLY_RX_MPDU_CMD records the firmware handed up
+	 *   rx_mgmt      management frames that survived iwx_rx_frame()'s
+	 *                pre-inputm filtering (AWDL promisc, duplicates, reorder)
+	 *   rx_beacon    of those, subtype 8 (beacon)
+	 *   rx_proberesp of those, subtype 5 (probe response)
+	 *
+	 * struct ieee80211com) counts how many of them reached
+	 * ieee80211_add_scan(), i.e. actually entered the scan result set.
+	 *
+	 *   rx_mpdu >> rx_mgmt     -> dropped inside iwx_rx_frame()
+	 *   rx_mgmt >> beacons     -> the firmware sends other traffic but no
+	 *                             foreign beacons (MAC filter / beacon filter)
+	 *   beacons >> beacon_evt  -> net80211 dropped them (badchan / chan
+	 *                             mismatch / element parse); ic_stats says which
+	 *   beacon_evt >> found    -> the results never left the driver
+	 */
+	/*
+	 * Node table contents at the end of the last scan: every node net80211
+	 * holds, and how many of them carry an SSID (i.e. were matched to a real
+	 * BSS rather than being an address we only transmitted to). Read at
+	 * numbers always describe the same completed scan.
+	 */
+	/*
+	 * Scan bring-up. Observed failure: phrase "no networks listed" while
+	 * ic_chan_active is already correct, isDriverAvailable stays 0 and the
+	 * IO80211 scan manager never leaves HALTED.
+	 *
+	 * The chain that produces exactly that is:
+	 *   iwx_init() -> ieee80211_begin_scan() -> iwx_newstate() -> newstate_task
+	 *   -> iwx_scan() -> iwx_umac_scan() -> iwx_send_cmd(SCAN_REQ_UMAC)
+	 * iwx_scan() sets ic->ic_state = S_SCAN itself (ItlIwx.cpp:15027) and only
+	 * skips it when iwx_umac_scan() returns an error. iwx_init() then waits up
+	 * to 1 s for that state and, on timeout, calls iwx_stop() and returns
+	 * EWOULDBLOCK - so IEEE80211_EVT_DRIVER_READY is never fired, the WCL
+	 * DriverAvailable message reports "not available" and the scan manager is
+	 * pinned in HALTED. Everything downstream (SCAN_REQ refused) follows.
+	 *
+	 *                      reached S_SCAN, 0x7fffffff = never called)
+	 *                      iwx_umac_scan(); negative = returned before send
+	 *                      (-ERANGE from the size check, -EIO from
+	 *                      iwx_fill_probe_req), 0x7fffffff = never reached
+	 */
+	/*
+	 * in iwx_umac_scan_v17(), sampled right after it returns (-1 = never
+	 * latency instead of only reporting the timeout: se=0 with a small ms
+	 * means the firmware answered, se=35 with ~1000 ms means it did not.
+	 */
+	/*
+	 * First firmware command that failed, recorded in iwx_send_cmd() - the
+	 * single choke point every command goes through. iwx_init_hw() runs a long
+	 * list of commands after INIT (tx antenna, BT coex, SOC config, DQA, aux
+	 * STA, phy contexts, LTR, temp threshold, power, MCC, SCAN_CFG, beacon
+	 * filter) and any one of them timing out makes iwx_init() fail with that
+	 * errno - which is exactly what xd9's ie=35 cannot distinguish, because
+	 * 35 (EWOULDBLOCK) is both "the 1 s S_SCAN wait expired" and "a command
+	 * sleep timed out". The id here names the command, so one boot answers it.
+	 *
+	 */
+	/*
+	 * Up to four distinct failing command ids, in arrival order (published
+	 * as xd13).
+	 *
+	 * iwx_init_hw() keeps going after a failed step, so one boot can name
+	 * every still-mismatched command instead of one per reboot. The same id
+	 * repeats for the three phy contexts, so consecutive duplicates collapse.
+	 */
+	/*
+	 * Commands that the group-0 -> long-group rewrite retargeted from
+	 * IWX_LONG_GROUP (0x01) to IWX_ALWAYS_LONG_GROUP (0x0e) because the
+	 * sc-a0 CMD_VERSIONS table only lists them in group 14.
+	 *
+	 * Published through xj "g14=". Zero on AX210/22000 (their tables have
+	 * no entry at all, so the historical group-1 path is kept).
+	 */
+	/*
+	 * PHY_CONTEXT_CMD version declared by the firmware's command-version
+	 * table (TLV 48), published as xd14 "phyv=".
+	 *
+	 * The SC image does ship that table (229 entries) and declares version 4
+	 * for PHY_CONTEXT_CMD. 3 would mean an older table, 0xff
+	 * (IWX_FW_CMD_VER_UNKNOWN) means the table was not parsed at all -- two
+	 * very different fixes, and only this field tells them apart. xd14 also
+	 * publishes sc->n_cmd_versions ("ncv=") as the direct evidence that the
+	 * table was consumed.
+	 */
+	/*
+	 * Scan bring-up chain counters (published through xd11).
+	 *
+	 * xd9 showed ie=35 with sv/sl/nc still -1, i.e. iwx_init() returned
+	 * EWOULDBLOCK without ever reaching iwx_umac_scan(). That leaves the
+	 * whole chain
+	 *
+	 *   iwx_init_hw() -> ieee80211_begin_scan() -> ieee80211_setmode()
+	 *   -> ieee80211_next_scan() -> ieee80211_new_state(S_SCAN)
+	 *   -> iwx_newstate() -> iwx_newstate_task() -> iwx_scan()
+	 *   -> iwx_umac_scan()
+	 *
+	 * undifferentiated, because 35 is also what every command sleep returns.
+	 * Each entry point below bumps one counter, so a single boot says exactly
+	 * which link is missing.
+	 *
+	 *                           (so iwx_init_hw() succeeded)
+	 *                           in the command gate
+	 *                           (0x7fffffff = iwx_scan() never failed)
+	 */
+	/*
+	 * 1 = iwx_add_aux_sta() returned early for SC.
+	 *
+	 * SC firmware's command-version table (TLV 48) has 229 entries but does
+	 * NOT declare ADD_STA in the LONG group, so iwx_lookup_cmd_ver() answers
+	 * UNKNOWN and the original "version >= 12" gate let the legacy ADD_STA
+	 * through. SC firmware never acked it (xd10: id=0x118 e=35), stalling
+	 * iwx_init_hw() before the scan could start. xd12 records that the new
+	 * family gate was taken, so one boot cannot be confused with "ADD_STA
+	 * was sent and happened to succeed".
+	 */
+	/*
+	 * MLD (MAC_CONF_GROUP) step errnos, published as xmld
+	 * "md=<MAC_CONFIG> lk=<LINK_CONFIG> st=<STA_CONFIG> ky=<SEC_KEY>
+	 *  rm=<STA_REMOVE>".
+	 *
+	 * 0x7fffffff = that step was never issued; 0 = acknowledged; anything
+	 * else is the errno. They are the only evidence the MLD branch ran at
+	 * all on a boot that never associates, because the six legacy paths that
+	 * are now bypassed used to report through xd10.
+	 */
+	/*
+	 * Replies that arrived for a command-queue slot which was still marked
+	 * IWX_TXDATA_FLAG_CMD_PENDING, but whose code no case in iwx_rx_pkt()
+	 * claimed. That packet falls into the "unhandled firmware response"
+	 * default, `handled` becomes 0, iwx_cmd_done() is skipped and the waiter
+	 * sleeps out its whole deadline even though the firmware DID answer.
+	 *
+	 * This is the exact shape of the v333 MAC_CONFIG failure
+	 * (xd10="id=0x308 e=35"): five MAC_CONF_GROUP/DATA_PATH case labels had
+	 * been dropped when the MLD path was ported, so 0x308/0x309/0x30a/0x30c/
+	 * 0x518 were acknowledged by the firmware and thrown away by the driver.
+	 * Keeping the counter means the next such omission is visible from a
+	 * single boot instead of looking like a dead firmware.
+	 *
+	 *   resp_unclaimed : how many such replies were discarded
+	 *   resp_uc_code   : wide id of the first one (0xffffffff = none yet)
+	 */
 
 	struct iwx_dma_info ctxt_info_dma;
 	struct iwx_self_init_dram init_dram;
@@ -659,7 +1007,17 @@ struct iwx_softc {
     struct iwx_dma_info prph_scratch_dma;
     struct iwx_dma_info prph_info_dma;
     struct iwx_dma_info iml_dma;
+    /*
+     * PNVM payload storage. With IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG the
+     * payload is split into per-section DRAM blocks (pnvm_seg_dma[0..pnvm_segs-1])
+     * and pnvm_dram holds only the address table (struct iwx_pnvm_info_dram).
+     * Without that capability pnvm_dram holds the concatenated payload and
+     * pnvm_segs stays 0.
+     */
     struct iwx_dma_info pnvm_dram;
+    struct iwx_dma_info pnvm_seg_dma[IWX_MAX_DRAM_ENTRY];
+    size_t pnvm_size;
+    int pnvm_segs;
 
 	int sc_fw_chunk_done;
 	int sc_init_complete;

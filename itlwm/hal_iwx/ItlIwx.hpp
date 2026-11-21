@@ -224,7 +224,10 @@ public:
     int    iwx_read_firmware(struct iwx_softc *);
     int    iwx_read_pnvm(struct iwx_softc *);
     int     iwx_load_pnvm(struct iwx_softc *);
+    int     iwx_pnvm_parse(struct iwx_softc *, const uint8_t *, size_t);
     int     iwx_pnvm_handle_section(struct iwx_softc *, const uint8_t *, size_t);
+    int     iwx_pnvm_setup(struct iwx_softc *, const uint8_t *const *,
+                            const size_t *, int);
     uint32_t iwx_read_prph_unlocked(struct iwx_softc *, uint32_t);
     uint32_t iwx_read_prph(struct iwx_softc *, uint32_t);
     uint32_t iwx_read_umac_prph(struct iwx_softc *, uint32_t);
@@ -255,6 +258,7 @@ public:
     void    iwx_reset_tx_ring(struct iwx_softc *, struct iwx_tx_ring *);
     void    iwx_free_tx_ring(struct iwx_softc *, struct iwx_tx_ring *);
     void    iwx_enable_rfkill_int(struct iwx_softc *);
+    void    iwx_note_intmask(struct iwx_softc *, const char *, uint32_t);
     int    iwx_check_rfkill(struct iwx_softc *);
     void    iwx_enable_interrupts(struct iwx_softc *);
     void    iwx_enable_fwload_interrupt(struct iwx_softc *);
@@ -430,6 +434,16 @@ public:
     int    iwx_umac_scan(struct iwx_softc *, int);
     int    iwx_umac_scan_v12(struct iwx_softc *, int);
     int    iwx_umac_scan_v14(struct iwx_softc *, int);
+    int    iwx_umac_scan_v17(struct iwx_softc *, int);
+    uint16_t iwx_scan_umac_flags_v2(struct iwx_softc *, int, bool);
+    uint8_t iwx_umac_scan_fill_channels_v5(struct iwx_softc *,
+            struct iwx_scan_channel_cfg_umac_v5 *, size_t, bool, uint32_t);
+    void   iwx_scan_umac_dwell_v11(struct iwx_softc *,
+            struct iwx_scan_general_params_v11 *, int);
+    void   iwx_scan_umac_fill_general_p_v11(struct iwx_softc *,
+            struct iwx_scan_general_params_v11 *, uint16_t, int);
+    void   iwx_scan_umac_fill_ch_p_v7(struct iwx_softc *,
+            struct iwx_scan_channel_params_v7 *, uint32_t, bool);
     void    iwx_mcc_update(struct iwx_softc *, struct iwx_mcc_chub_notif *);
     uint8_t    iwx_ridx2rate(struct ieee80211_rateset *, int);
     int    iwx_rval2ridx(int);
@@ -440,6 +454,17 @@ public:
     void    iwx_mac_ctxt_cmd_fill_sta(struct iwx_softc *, struct iwx_node *,
             struct iwx_mac_data_sta *, int);
     int    iwx_mac_ctxt_cmd(struct iwx_softc *, struct iwx_node *, uint32_t, int);
+    /*
+     * MLD API (MAC_CONF_GROUP 0x03). Only reached when sc_use_mld_api is set;
+     * the legacy commands above stay byte-identical for AX210/22000.
+     */
+    int    iwx_mld_mac_ctxt_cmd(struct iwx_softc *, struct iwx_node *, uint32_t, int);
+    int    iwx_mld_add_sta_cmd(struct iwx_softc *, struct iwx_node *, int);
+    int    iwx_mld_rm_sta_cmd(struct iwx_softc *, struct iwx_node *);
+    void   iwx_mld_modify_link_fill(struct iwx_softc *, struct iwx_node *,
+            struct iwx_link_config_cmd *, int, int);
+    int    iwx_mld_set_key(struct iwx_softc *, struct ieee80211_node *,
+            struct ieee80211_key *, uint32_t);
     int    iwx_clear_statistics(struct iwx_softc *);
     int    iwx_update_quotas(struct iwx_softc *, struct iwx_node *, int);
     void    iwx_add_task(struct iwx_softc *, struct taskq *, struct task *);
@@ -525,6 +550,10 @@ public:
     size_t iwx_rx_buf_used(struct iwx_softc *, const uint8_t *);
     void    iwx_rx_pkt(struct iwx_softc *, struct iwx_rx_data *,
             struct mbuf_list *);
+    void    iwx_rx_inc_wr_ptr(struct iwx_softc *, struct iwx_rx_ring *,
+            uint32_t);
+    uint32_t iwx_rx_restock_aligned(struct iwx_softc *,
+            struct iwx_rx_ring *);
     void    iwx_notif_intr(struct iwx_softc *);
     static int    iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count);
     static int    iwx_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count);

@@ -11,3 +11,7 @@ MacKernelSDK
 include/FwBinary.cpp
 .DS_Store
 *.log
+
+# local build output
+out-*/
+MacKernelSDK/
