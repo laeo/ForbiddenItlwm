@@ -2108,6 +2108,7 @@ void AirportItlwm::free()
         IOFree(btcProfile, sizeof(struct apple80211_btc_profiles_data));
         btcProfile = NULL;
     }
+    releasePmCallLock();
     super::free();
 }
 
@@ -2772,7 +2773,6 @@ setPOWER(OSObject *object,
         }
         power_state = (pd->power_state[0]);
     }
-
     return kIOReturnSuccess;
 #else
     if (!pd)
@@ -2922,22 +2922,111 @@ static IOPMPowerState powerStateArray[kPowerStateCount] =
     {1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0}
 };
 
+/*
+ * Waits (bounded) for a power-state call that is already running to finish.
+ * Returns true when nothing is in flight any more.
+ *
+ * Two consecutive zero samples are required: thread_call dequeues a call before
+ * running it, so right after thread_call_cancel() returns false the callback body
+ * may not have reached pmCallEnter() yet and one sample would read zero. Without
+ * the private cancel-and-wait there is no way to close that window completely,
+ * which is why an uncomfortable answer below leaks instead of freeing.
+ */
+void AirportItlwm::pmCallEnter()
+{
+    if (pmCallLock == NULL)
+        return;
+    IOLockLock(pmCallLock);
+    pmCallInFlight++;
+    IOLockUnlock(pmCallLock);
+}
+
+void AirportItlwm::pmCallExit()
+{
+    if (pmCallLock == NULL)
+        return;
+    IOLockLock(pmCallLock);
+    if (pmCallInFlight > 0)
+        pmCallInFlight--;
+    IOLockUnlock(pmCallLock);
+}
+
+bool AirportItlwm::waitForPowerCallToFinish()
+{
+    if (pmCallLock == NULL)
+        return false;
+    for (int i = 0; i < 1000; i++) {          // up to ~1 s
+        if (IOLockTryLock(pmCallLock)) {
+            const bool idle = pmCallInFlight == 0;
+            IOLockUnlock(pmCallLock);
+            if (idle) {
+                IOSleep(1);
+                if (IOLockTryLock(pmCallLock)) {
+                    const bool idleAgain = pmCallInFlight == 0;
+                    IOLockUnlock(pmCallLock);
+                    if (idleAgain)
+                        return true;
+                }
+            }
+        }
+        IOSleep(1);
+    }
+    return false;
+}
+
+void AirportItlwm::releasePmCallLock()
+{
+    /*
+     * Never free the lock while a callback may still take it: pmCallExit() would
+     * then touch freed memory. Leaking a few bytes is the cheaper end of that
+     * trade, and this only happens if a power call never returned.
+     */
+    if (pmCallLock == NULL)
+        return;
+    if (IOLockTryLock(pmCallLock)) {
+        const bool idle = pmCallInFlight == 0;
+        IOLockUnlock(pmCallLock);
+        if (idle) {
+            IOLockFree(pmCallLock);
+            pmCallLock = NULL;
+        }
+        return;
+    }
+}
+
 void AirportItlwm::unregistPM()
 {
     // A call still pending would run after stop, against a command gate that is gone. Cancel it,
     // or wait for one already running, and drop the reference setPowerState took for it.
     if (powerOffThreadCall) {
-        if (thread_call_cancel_wait(powerOffThreadCall))
+        const bool cancelled = thread_call_cancel(powerOffThreadCall) != FALSE;
+        if (cancelled) {
             release();
+        } else if (!waitForPowerCallToFinish()) {
+            /*
+             * Still running after ~1 s: leave the thread call and the reference
+             * alone rather than free them under the callback.
+             */
+            XYLog("%s: power-off call did not finish; leaking it\n", __FUNCTION__);
+            releasePmCallLock();
+            return;
+        }
         thread_call_free(powerOffThreadCall);
         powerOffThreadCall = NULL;
     }
     if (powerOnThreadCall) {
-        if (thread_call_cancel_wait(powerOnThreadCall))
+        const bool cancelled = thread_call_cancel(powerOnThreadCall) != FALSE;
+        if (cancelled) {
             release();
+        } else if (!waitForPowerCallToFinish()) {
+            XYLog("%s: power-on call did not finish; leaking it\n", __FUNCTION__);
+            releasePmCallLock();
+            return;
+        }
         thread_call_free(powerOnThreadCall);
         powerOnThreadCall = NULL;
     }
+    releasePmCallLock();
 }
 
 IOReturn AirportItlwm::setPowerState(unsigned long powerStateOrdinal, IOService *policyMaker)
@@ -2983,6 +3072,7 @@ static void handleSetPowerStateOff(thread_call_param_t param0,
 
     if (param1 == 0)
     {
+        self->pmCallEnter();
         self->getCommandGate()->runAction((IOCommandGate::Action)
                                            handleSetPowerStateOff,
                                            (void *) 1);
@@ -2990,6 +3080,7 @@ static void handleSetPowerStateOff(thread_call_param_t param0,
     else
     {
         self->setPowerStateOff();
+        self->pmCallExit();
         self->release();
     }
 }
@@ -3001,6 +3092,7 @@ static void handleSetPowerStateOn(thread_call_param_t param0,
 
     if (param1 == 0)
     {
+        self->pmCallEnter();
         self->getCommandGate()->runAction((IOCommandGate::Action)
                                            handleSetPowerStateOn,
                                            (void *) 1);
@@ -3008,6 +3100,7 @@ static void handleSetPowerStateOn(thread_call_param_t param0,
     else
     {
         self->setPowerStateOn();
+        self->pmCallExit();
         self->release();
     }
 }
@@ -3019,6 +3112,8 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
     pmPowerState = kPowerStateOn;
     pmPolicyMaker = policyMaker;
 
+    if (pmCallLock == NULL)
+        pmCallLock = IOLockAlloc();
     powerOffThreadCall = thread_call_allocate(
                                             (thread_call_func_t)handleSetPowerStateOff,
                                             (thread_call_param_t)this);
