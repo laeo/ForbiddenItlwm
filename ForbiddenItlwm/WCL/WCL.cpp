@@ -522,7 +522,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         joinTimer->setTimeoutMS(30000);
         return kIOReturnSuccess;
     }
-    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
+    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending ||
+        (scanPending && !ic->ic_wcl_join_during_scan)) {
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
