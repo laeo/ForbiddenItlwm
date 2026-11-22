@@ -4324,11 +4324,13 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size, int s
     int fwqid;
     uint32_t wr_idx;
     size_t resp_len;
+    int cmd_ver;
     struct iwx_tx_queue_cfg_cmd cmd = {
         .flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE),
         .sta_id = static_cast<uint8_t>(stationId),
         .tid = (uint8_t)tid,
     };
+    struct iwx_scd_queue_cfg_cmd cmd_v3;
     struct iwx_rx_packet *pkt;
     struct iwx_tx_queue_cfg_rsp *resp;
     struct iwx_host_cmd hcmd = {
@@ -4394,12 +4396,43 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size, int s
             goto fail;
         }
     }
-    cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
-    cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
-    cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
-
-    hcmd.data[0] = &cmd;
-    hcmd.len[0] = sizeof(cmd);
+    /*
+     * SC firmware declares (DATA_PATH_GROUP, SCD_QUEUE_CONFIG_CMD) = v3 and
+     * answers nothing for the legacy (LONG_GROUP, 0x1d) struct.  The management
+     * queue already uses the v3 form (iwx_enable_txq); the A-MPDU/BA path used
+     * to keep sending legacy 0x1d here, which cost a 1 s timeout on every
+     * iwx_ampdu_tx_start and wedged the command ring (v339 real machine:
+     * xd10="id=0x11d e=35", repeated 0x1d sends, no DHCP TX).
+     */
+    cmd_ver = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
+                                 IWX_SCD_QUEUE_CONFIG_CMD);
+    if (cmd_ver == 3) {
+        memset(&cmd_v3, 0, sizeof(cmd_v3));
+        cmd_v3.operation = htole32(IWX_SCD_QUEUE_ADD);
+        cmd_v3.u.add.tfdq_dram_addr = htole64(ring->desc_dma.paddr);
+        cmd_v3.u.add.bc_dram_addr = htole64(ring->bc_tbl.paddr);
+        cmd_v3.u.add.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
+        cmd_v3.u.add.flags = htole32(0);
+        cmd_v3.u.add.sta_mask = htole32(1 << stationId);
+        cmd_v3.u.add.tid = (uint8_t)tid;
+        hcmd.id = IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD);
+        hcmd.data[0] = &cmd_v3;
+        hcmd.len[0] = sizeof(cmd_v3);
+        XYLog("%s: SCD_QUEUE_CONFIG v3 sta=%d tid=%d size=%u\n",
+              __FUNCTION__, stationId, tid, (unsigned)ring->ring_count);
+    } else if (cmd_ver == 0 || cmd_ver == IWX_FW_CMD_VER_UNKNOWN) {
+        cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
+        cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
+        cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
+        hcmd.id = IWX_SCD_QUEUE_CFG;
+        hcmd.data[0] = &cmd;
+        hcmd.len[0] = sizeof(cmd);
+    } else {
+        XYLog("%s: unsupported SCD_QUEUE_CFG command version %d\n",
+              __FUNCTION__, cmd_ver);
+        err = -ENOTSUP;
+        goto fail;
+    }
 
 #ifdef AIRPORT_VTD
     submitted = true;
