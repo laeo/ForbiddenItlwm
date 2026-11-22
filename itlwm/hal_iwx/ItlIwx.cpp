@@ -15059,6 +15059,14 @@ iwx_umac_scan_v17(struct iwx_softc *sc, int bgscan)
 #ifdef AIRPORT_WCL
     scanActive = AirportWCL::scanUsesProbes(ic->ic_wcl_scan_requested,
                                             ic->ic_wcl_scan_active);
+    /*
+     * MLD/SC: passive scans only. Probing every channel drops the link and
+     * makes macOS reconnect during ordinary traffic, and that scan churn is
+     * what interrupts DHCP/association. Beacons still fill the scan list;
+     * other device families keep their active scans.
+     */
+    if (sc->sc_use_mld_api)
+        scanActive = false;
 #endif
     
     /* v11 general params and v7 channel params must not change size. */
