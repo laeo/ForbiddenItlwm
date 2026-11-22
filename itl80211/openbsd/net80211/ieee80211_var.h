@@ -402,6 +402,37 @@ struct ieee80211_defrag {
 
 struct ieee80211com {
 	struct arpcom		ic_ac;
+	/*
+	 * Local WCL/scan counters used by the e440 build's ioreg diagnostics
+	 * (xv/xd9).  They were referenced by the imported v339 ItlIwx.cpp but
+	 * the struct fields were never committed with it; keep them here so the
+	 * tree builds and the counters stay per-interface.
+	 */
+	u_int32_t		ic_diag_beacon_evt;
+	u_int32_t		ic_diag_wcl_abort;
+	u_int32_t		ic_diag_wcl_badchan;
+	u_int32_t		ic_diag_wcl_busy;
+	u_int32_t		ic_diag_wcl_chspec;
+	u_int32_t		ic_diag_wcl_fin;
+	u_int32_t		ic_diag_wcl_ies;
+	u_int32_t		ic_diag_wcl_ies4;
+	u_int32_t		ic_diag_wcl_join_aborted;
+	u_int32_t		ic_diag_wcl_join_busy;
+	u_int32_t		ic_diag_wcl_join_req;
+	u_int32_t		ic_diag_wcl_join_unsup;
+	u_int32_t		ic_diag_wcl_nochan;
+	u_int32_t		ic_diag_wcl_nomem;
+	u_int32_t		ic_diag_wcl_notready;
+	u_int32_t		ic_diag_wcl_post;
+	u_int32_t		ic_diag_wcl_pub;
+	u_int32_t		ic_diag_wcl_pub_nopend;
+	u_int32_t		ic_diag_wcl_req;
+	u_int32_t		ic_diag_wcl_req_chans;
+	u_int32_t		ic_diag_wcl_reuse;
+	u_int32_t		ic_diag_wcl_skip;
+	u_int32_t		ic_diag_wcl_ssid;
+	u_int32_t		ic_diag_wcl_timeout;
+	u_int32_t		ic_diag_wcl_unsup;
 	LIST_ENTRY(ieee80211com) ic_list;	/* chain of all ieee80211com */
 	void			(*ic_recv_mgmt)(struct ieee80211com *,
 				    mbuf_t, struct ieee80211_node *,

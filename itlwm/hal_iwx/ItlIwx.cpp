@@ -5232,8 +5232,10 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
      * OpenBSD dispatches on IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT
      * (ob-if_iwx.c:3560-3568); use the same split.
      */
-    if (sc->sc_use_mld_api ||
-        isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT)) {
+    bool mld_baid = sc->sc_use_mld_api ||
+        isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT);
+
+    if (mld_baid) {
         uint32_t new_baid = 0;
 
         /*
@@ -5377,15 +5379,31 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
         }
     }
 
-    /* Deaggregation is done in hardware. */
+    /*
+     * Deaggregation is done in hardware.
+     *
+     * `baid` was already produced by the branch above: the MLD branch got it
+     * from RX_BAID_ALLOCATION_CONFIG's response, the legacy branch decoded it
+     * out of ADD_STA's status word.  Decoding `status` again here is what
+     * broke v341/v342: on the MLD path `status` is never written, the build
+     * zero-initialises it (tools/build.py -ftrivial-auto-var-init=zero), so
+     * IWX_ADD_STA_BAID_VALID_MASK was always clear and every ADDBA was
+     * refused after the firmware had already allocated the BAID.  The AP then
+     * saw a refusal while the firmware kept stamping reorder_data with a BAID
+     * the host had not registered, so unicast frames were dropped and ping
+     * never answered.  v351 "fixed" that by refusing the ADDBA before the
+     * command, which is why throughput collapsed to unaggregated rates.
+     */
     if (start) {
-        if (!(status & IWX_ADD_STA_BAID_VALID_MASK)) {
-            ieee80211_addba_req_refuse(ic, ni, tid);
-            splx(s);
-            return EIO;
+        if (!mld_baid) {
+            if (!(status & IWX_ADD_STA_BAID_VALID_MASK)) {
+                ieee80211_addba_req_refuse(ic, ni, tid);
+                splx(s);
+                return EIO;
+            }
+            baid = (status & IWX_ADD_STA_BAID_MASK) >>
+            IWX_ADD_STA_BAID_SHIFT;
         }
-        baid = (status & IWX_ADD_STA_BAID_MASK) >>
-        IWX_ADD_STA_BAID_SHIFT;
         if (baid == IWX_RX_REORDER_DATA_INVALID_BAID ||
             baid >= nitems(sc->sc_rxba_data)) {
             ieee80211_addba_req_refuse(ic, ni, tid);
@@ -5429,6 +5447,9 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
     
     if (start) {
         sc->sc_rx_ba_sessions++;
+        XYLog("%s: accept RX BA tid=%d baid=%u ssn=%u win=%u (mld=%d)\n",
+              __FUNCTION__, tid, (unsigned)baid, (unsigned)ssn,
+              (unsigned)winsize, (int)mld_baid);
         ieee80211_addba_req_accept(ic, ni, tid);
     } else if (sc->sc_rx_ba_sessions > 0)
         sc->sc_rx_ba_sessions--;
