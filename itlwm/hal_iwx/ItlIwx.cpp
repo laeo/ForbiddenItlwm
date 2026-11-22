@@ -5236,6 +5236,46 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
         isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT)) {
         uint32_t new_baid = 0;
 
+        /*
+         * A new ADDBA session for a TID that still has a BAID in the firmware
+         * is ignored: the firmware keeps one BAID per (station, TID), and the
+         * old session is not torn down by a DELBA in this stack.  v341 real
+         * machine showed the second tid=0 ADD timing out (Sending command
+         * 5.16, no done), then link loss under traffic.  Remove the stale
+         * session (and its reorder buffer) before re-adding.
+         */
+        if (start) {
+            for (int old_i = 0; old_i < (int)nitems(sc->sc_rxba_data);
+                 old_i++) {
+                struct iwx_rxba_data *old = &sc->sc_rxba_data[old_i];
+                if (old->baid == IWX_RX_REORDER_DATA_INVALID_BAID ||
+                    old->tid != tid)
+                    continue;
+                memset(&baid_cmd, 0, sizeof(baid_cmd));
+                baid_cmd.action = htole32(IWX_RX_BAID_ACTION_REMOVE);
+                if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
+                        IWX_RX_BAID_ALLOCATION_CONFIG_CMD) == 1) {
+                    baid_cmd.remove_v1.baid = htole32(old->baid);
+                } else {
+                    baid_cmd.remove.sta_id_mask =
+                        htole32(1 << IWX_STATION_ID);
+                    baid_cmd.remove.tid = htole32(tid);
+                }
+                uint32_t dummy_baid = 0;
+                (void)iwx_send_cmd_pdu_status(sc,
+                      IWX_WIDE_ID(IWX_DATA_PATH_GROUP,
+                                  IWX_RX_BAID_ALLOCATION_CONFIG_CMD),
+                      sizeof(baid_cmd), &baid_cmd, &dummy_baid);
+                XYLog("%s: removed stale BAID %u tid %d before re-add\n",
+                      __FUNCTION__, (unsigned)old->baid, tid);
+                iwx_clear_reorder_buffer(sc, old);
+                old->baid = IWX_RX_REORDER_DATA_INVALID_BAID;
+                if (sc->sc_rx_ba_sessions > 0)
+                    sc->sc_rx_ba_sessions--;
+                break;
+            }
+        }
+
         memset(&baid_cmd, 0, sizeof(baid_cmd));
         if (start) {
             baid_cmd.action = htole32(IWX_RX_BAID_ACTION_ADD);
