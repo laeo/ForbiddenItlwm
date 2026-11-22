@@ -8686,6 +8686,20 @@ struct iwx_rx_baid_cfg_cmd {
     } __packed;
 } __packed; /* RX_BAID_ALLOCATION_CONFIG_CMD_API_S_VER_2 */
 
+/* Compile-time ABI checks: a layout change here silently breaks RX reorder. */
+static_assert(sizeof(struct iwx_rx_baid_cfg_cmd_alloc) == 12,
+              "RX_BAID alloc must be 12 bytes");
+static_assert(offsetof(struct iwx_rx_baid_cfg_cmd_alloc, tid) == 4,
+              "RX_BAID alloc.tid offset");
+static_assert(offsetof(struct iwx_rx_baid_cfg_cmd_alloc, ssn) == 8,
+              "RX_BAID alloc.ssn offset");
+static_assert(offsetof(struct iwx_rx_baid_cfg_cmd_alloc, win_size) == 10,
+              "RX_BAID alloc.win_size offset");
+static_assert(sizeof(struct iwx_rx_baid_cfg_cmd) == 16,
+              "RX_BAID command v2 must be 16 bytes");
+static_assert(offsetof(struct iwx_rx_baid_cfg_cmd, alloc) == 4,
+              "RX_BAID command payload offset");
+
 #define IWX_SEC_KEY_CMD                 0x18
 #define IWX_SEC_KEY_FLAG_CIPHER_MASK    0x07
 #define IWX_SEC_KEY_FLAG_CIPHER_WEP     0x01
