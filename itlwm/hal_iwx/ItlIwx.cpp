@@ -5208,6 +5208,7 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
     XYLog("%s start=%d tid=%d ssn=%d winsize=%d\n", __FUNCTION__, start, tid, ssn, winsize);
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_add_sta_cmd cmd;
+    struct iwx_rx_baid_cfg_cmd baid_cmd;
     struct iwx_node *in = (struct iwx_node *)ni;
     int err, s, generation = sc->sc_generation;
     uint32_t status;
@@ -5222,38 +5223,120 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
         return ENOSPC;
     }
     
-    memset(&cmd, 0, sizeof(cmd));
-    
-    cmd.sta_id = IWX_STATION_ID;
-    cmd.mac_id_n_color
-    = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color));
-    cmd.add_modify = IWX_STA_MODE_MODIFY;
-    
-    if (start) {
-        cmd.add_immediate_ba_tid = (uint8_t)tid;
-        cmd.add_immediate_ba_ssn = htole16(ssn);
-        cmd.rx_ba_window = htole16(winsize);
+    /*
+     * SC / MLD firmware has no legacy ADD_STA (0x18) in the LONG group; RX
+     * block-ack sessions are configured through
+     * RX_BAID_ALLOCATION_CONFIG_CMD (DATA_PATH_GROUP 0x16).  Sending the old
+     * ADD_STA MODIFY there costs a 1 s timeout (v340 real machine:
+     * xd10="id=0x118 e=35") and leaves the RX reorder session unconfigured.
+     * OpenBSD dispatches on IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT
+     * (ob-if_iwx.c:3560-3568); use the same split.
+     */
+    if (sc->sc_use_mld_api ||
+        isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT)) {
+        uint32_t new_baid = 0;
+
+        memset(&baid_cmd, 0, sizeof(baid_cmd));
+        if (start) {
+            baid_cmd.action = htole32(IWX_RX_BAID_ACTION_ADD);
+            baid_cmd.alloc.sta_id_mask = htole32(1 << IWX_STATION_ID);
+            baid_cmd.alloc.tid = (uint8_t)tid;
+            baid_cmd.alloc.ssn = htole16(ssn);
+            baid_cmd.alloc.win_size = htole16(winsize);
+        } else {
+            baid_cmd.action = htole32(IWX_RX_BAID_ACTION_REMOVE);
+            if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
+                    IWX_RX_BAID_ALLOCATION_CONFIG_CMD) == 1) {
+                uint8_t old_baid = 0;
+                for (int i = 0; i < (int)nitems(sc->sc_rxba_data); i++) {
+                    if (sc->sc_rxba_data[i].baid !=
+                        IWX_RX_REORDER_DATA_INVALID_BAID &&
+                        sc->sc_rxba_data[i].tid == tid) {
+                        old_baid = sc->sc_rxba_data[i].baid;
+                        break;
+                    }
+                }
+                baid_cmd.remove_v1.baid = htole32(old_baid);
+            } else {
+                baid_cmd.remove.sta_id_mask = htole32(1 << IWX_STATION_ID);
+                baid_cmd.remove.tid = htole32(tid);
+            }
+        }
+
+        err = iwx_send_cmd_pdu_status(sc,
+              IWX_WIDE_ID(IWX_DATA_PATH_GROUP,
+                          IWX_RX_BAID_ALLOCATION_CONFIG_CMD),
+              sizeof(baid_cmd), &baid_cmd, &new_baid);
+
+        if (generation != sc->sc_generation) {
+            splx(s);
+            return ENXIO;
+        }
+        if (err) {
+            if (start)
+                ieee80211_addba_req_refuse(ic, ni, tid);
+            splx(s);
+            return err;
+        }
+        if (start) {
+            if (new_baid >= nitems(sc->sc_rxba_data)) {
+                ieee80211_addba_req_refuse(ic, ni, tid);
+                splx(s);
+                return ERANGE;
+            }
+            baid = (uint8_t)new_baid;
+        }
+        XYLog("%s: BAID cfg start=%d tid=%d baid=%u\n",
+              __FUNCTION__, start, tid, (unsigned)baid);
     } else {
-        cmd.remove_immediate_ba_tid = (uint8_t)tid;
+        memset(&cmd, 0, sizeof(cmd));
+
+        cmd.sta_id = IWX_STATION_ID;
+        cmd.mac_id_n_color
+        = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color));
+        cmd.add_modify = IWX_STA_MODE_MODIFY;
+
+        if (start) {
+            cmd.add_immediate_ba_tid = (uint8_t)tid;
+            cmd.add_immediate_ba_ssn = htole16(ssn);
+            cmd.rx_ba_window = htole16(winsize);
+        } else {
+            cmd.remove_immediate_ba_tid = (uint8_t)tid;
+        }
+        cmd.modify_mask = start ? IWX_STA_MODIFY_ADD_BA_TID :
+        IWX_STA_MODIFY_REMOVE_BA_TID;
+
+        status = IWX_ADD_STA_SUCCESS;
+        err = iwx_send_cmd_pdu_status(sc, IWX_ADD_STA, sizeof(cmd), &cmd,
+                                      &status);
+
+        if (generation != sc->sc_generation) {
+            splx(s);
+            return ENXIO;
+        }
+        if (err || (status & IWX_ADD_STA_STATUS_MASK) != IWX_ADD_STA_SUCCESS) {
+            if (start)
+                ieee80211_addba_req_refuse(ic, ni, tid);
+            splx(s);
+            return err ? err : EIO;
+        }
+        if (start) {
+            if (!(status & IWX_ADD_STA_BAID_VALID_MASK)) {
+                ieee80211_addba_req_refuse(ic, ni, tid);
+                splx(s);
+                return EIO;
+            }
+            baid = (status & IWX_ADD_STA_BAID_MASK) >>
+            IWX_ADD_STA_BAID_SHIFT;
+            if (baid == IWX_RX_REORDER_DATA_INVALID_BAID ||
+                baid >= nitems(sc->sc_rxba_data)) {
+                ieee80211_addba_req_refuse(ic, ni, tid);
+                splx(s);
+                return EIO;
+            }
+        }
     }
-    cmd.modify_mask = start ? IWX_STA_MODIFY_ADD_BA_TID :
-    IWX_STA_MODIFY_REMOVE_BA_TID;
-    
-    status = IWX_ADD_STA_SUCCESS;
-    err = iwx_send_cmd_pdu_status(sc, IWX_ADD_STA, sizeof(cmd), &cmd,
-                                  &status);
-    
-    if (generation != sc->sc_generation) {
-        splx(s);
-        return ENXIO;
-    }
-    if (err || (status & IWX_ADD_STA_STATUS_MASK) != IWX_ADD_STA_SUCCESS) {
-        if (start)
-            ieee80211_addba_req_refuse(ic, ni, tid);
-        splx(s);
-        return err ? err : EIO;
-    }
-    
+
     /* Deaggregation is done in hardware. */
     if (start) {
         if (!(status & IWX_ADD_STA_BAID_VALID_MASK)) {
@@ -20273,6 +20356,8 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_TIME_EVENT_CMD:
             case IWX_STATISTICS_CMD:
             case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD):
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP,
+                             IWX_RX_BAID_ALLOCATION_CONFIG_CMD):
             case IWX_SCD_QUEUE_CFG: {
                 size_t pkt_len;
                 

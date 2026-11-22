@@ -1534,6 +1534,7 @@ enum iwx_msix_ivar_for_cause {
  * MAC_CONTEXT entry outside the (notification-only) group 0x0e.  That is why
  * the legacy 0x128 and the 0xE28 retarget both time out on this device.
  */
+#define IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT        63
 #define IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT        110
 #define IWX_UCODE_TLV_CAPA_LED_CMD_SUPPORT        88
 
@@ -8647,6 +8648,44 @@ static_assert(sizeof(struct iwx_sta_cfg_cmd_v1) == 96,
 struct iwx_sta_remove_cmd {
     uint32_t sta_id;
 } __packed; /* REMOVE_STA_API_S_VER_1 */
+
+#define IWX_RX_BAID_ALLOCATION_CONFIG_CMD 0x16
+#define IWX_RX_BAID_ACTION_ADD          0
+#define IWX_RX_BAID_ACTION_MODIFY       1
+#define IWX_RX_BAID_ACTION_REMOVE       2
+
+struct iwx_rx_baid_cfg_cmd_alloc {
+    uint32_t sta_id_mask;
+    uint8_t tid;
+    uint8_t reserved[3];
+    uint16_t ssn;
+    uint16_t win_size;
+} __packed; /* RX_BAID_ALLOCATION_ADD_CMD_API_S_VER_1 */
+
+struct iwx_rx_baid_cfg_cmd_modify {
+    uint32_t old_sta_id_mask;
+    uint32_t new_sta_id_mask;
+    uint32_t tid;
+} __packed; /* RX_BAID_ALLOCATION_MODIFY_CMD_API_S_VER_2 */
+
+struct iwx_rx_baid_cfg_cmd_remove_v1 {
+    uint32_t baid;
+} __packed; /* RX_BAID_ALLOCATION_REMOVE_CMD_API_S_VER_1 */
+
+struct iwx_rx_baid_cfg_cmd_remove {
+    uint32_t sta_id_mask;
+    uint32_t tid;
+} __packed; /* RX_BAID_ALLOCATION_REMOVE_CMD_API_S_VER_2 */
+
+struct iwx_rx_baid_cfg_cmd {
+    uint32_t action;
+    union {
+        struct iwx_rx_baid_cfg_cmd_alloc alloc;
+        struct iwx_rx_baid_cfg_cmd_modify modify;
+        struct iwx_rx_baid_cfg_cmd_remove_v1 remove_v1;
+        struct iwx_rx_baid_cfg_cmd_remove remove;
+    } __packed;
+} __packed; /* RX_BAID_ALLOCATION_CONFIG_CMD_API_S_VER_2 */
 
 #define IWX_SEC_KEY_CMD                 0x18
 #define IWX_SEC_KEY_FLAG_CIPHER_MASK    0x07
