@@ -355,6 +355,22 @@ IOReturn AirportItlwmSkywalkInterface::startWCLScan(apple80211ScanRequest *reque
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     scanSource->setTimeoutMS(20000);
     if (ic->ic_state == IEEE80211_S_RUN) {
+        /*
+         * MLD/SC only: do not start the cache background scan.
+         *
+         * ieee80211_begin_cache_bgscan() sets IEEE80211_F_BGSCAN, and if the
+         * firmware scan never completes the flag is never cleared. While it
+         * is set, net80211 parks the output queue and every later scan is
+         * refused kIOReturnBusy, so DHCP requests never reach the air
+         * (observed: ItlwmScanStats bgscan stuck at 1, busy=..325..).
+         * Answer this request as completed instead; the join path keeps
+         * roaming working. Other device families keep the scan.
+         */
+        if (ic->ic_wcl_join_during_scan) {
+            ++wclScanStats.accepted;
+            finishWCLScan(kIOReturnSuccess);
+            return kIOReturnSuccess;
+        }
         ieee80211_begin_cache_bgscan(&ic->ic_if);
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
             scanPending = false;
